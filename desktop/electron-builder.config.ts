@@ -271,7 +271,12 @@ const config: Configuration = {
         'out/ui/**/*',
         'out/resources/**/*',
         'resources/icons/**/*',
-        'package.json'
+        'package.json',
+        // electron-builder v26 automatically adds production dependencies
+        // unless node_modules is explicitly excluded. Main/preload dependencies
+        // are bundled by electron-vite, so no node_modules files belong in ASAR.
+        '!node_modules',
+        '!node_modules/**/*'
     ],
     /**
      * Ship the modular Go subprocesses outside the asar so the Electron main
