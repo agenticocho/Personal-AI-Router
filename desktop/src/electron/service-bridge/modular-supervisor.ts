@@ -343,8 +343,8 @@ class ModularSupervisor {
     private nextReadinessWaiterId = 0
     private readinessReported = false
     // Per-engine local-node → proxy bridge state (the #5 "no active node" fix).
-    // Desired state is sourced from each engine's local engine:state-changed; the
-    // bridged* fields track what we have actually pushed into the proxy so
+    // Desired state is sourced from local engine state events and broker-ready
+    // hydration; bridged* tracks what we have actually pushed into the proxy so
     // reconcile is idempotent and re-bridges after a proxy restart.
     private localBridges = new Map<ProxyEngine, LocalEngineBridge>()
     // Engines whose cached [] was written only because the engine stopped.
@@ -1134,6 +1134,10 @@ class ModularSupervisor {
             if (!obj || !Array.isArray(obj.engines)) return
             for (const engine of obj.engines) {
                 getModularBridgeState().applyEngineManagerStatus(engine)
+                // Hydration is also an authoritative local-engine state source.
+                // Seed bridge state so an already-running engine does not depend
+                // on a later engine:state-changed notification.
+                this.updateLocalNodeBridgeFromEngineState(engine)
                 this.refreshManagedEngineModels(engine)
             }
         } catch (err) {

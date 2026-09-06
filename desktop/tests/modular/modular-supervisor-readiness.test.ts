@@ -10,6 +10,7 @@ import {
 const mocks = vi.hoisted(() => ({
     bridgeState: {
         handleNotification: vi.fn(),
+        applyEngineManagerStatus: vi.fn(),
         getSelfId: vi.fn<() => string | null>(() => null),
         getProxyPort: vi.fn<() => number | null>(() => null),
         setSelfId: vi.fn<(id: string) => void>()
@@ -99,6 +100,13 @@ describe('modular supervisor readiness', () => {
         supervisor.brokerReady = false
         supervisor.brokerHydrationDone = false
         supervisor.processes.clear()
+
+        const localBridges = Reflect.get(supervisor, 'localBridges')
+        if (!(localBridges instanceof Map)) {
+            throw new Error('localBridges is unavailable')
+        }
+        localBridges.clear()
+
         supervisor.onReady = undefined
         supervisor.onBrokerReady = vi.fn().mockResolvedValue(undefined)
     })
@@ -261,6 +269,107 @@ describe('modular supervisor readiness', () => {
         })
 
         await Reflect.apply(resolveSelfId, supervisor, [])
+        await Promise.resolve()
+
+        expect(callProxy).toHaveBeenCalledTimes(1)
+    })
+
+    it('bridges a hydrated running engine after self identity resolves first', async () => {
+        const resolvedId = '8bb927c3-4f07-4ad7-9bb6-e2cf3f88676a'
+        let selfId: string | null = null
+        let proxyPort: number | null = null
+
+        mocks.bridgeState.getSelfId.mockImplementation(() => selfId)
+        mocks.bridgeState.getProxyPort.mockImplementation(() => proxyPort)
+        mocks.bridgeState.setSelfId.mockImplementation((id: string) => {
+            selfId = id
+        })
+
+        const callProcess = vi.fn(async (_name: string, method: string) => {
+            if (method === 'cluster:get-node-id') {
+                return { nodeUuid: resolvedId }
+            }
+            if (method === 'engine:get-installed') {
+                return {
+                    engines: [
+                        {
+                            engine: 'llamacpp',
+                            displayName: 'llama.cpp',
+                            installed: true,
+                            running: true,
+                            healthy: true,
+                            port: 18434
+                        }
+                    ]
+                }
+            }
+            if (method === 'engine:action') {
+                return { models: [] }
+            }
+            throw new Error(`unexpected broker method ${method}`)
+        })
+        const callProxy = vi.fn().mockResolvedValue({ added: true })
+
+        Reflect.set(supervisor, 'callProcess', callProcess)
+        Reflect.set(supervisor, 'callProxy', callProxy)
+        supervisor.processes.set('broker', new JsonRpcSubprocess('broker', 'test-broker'))
+
+        const resolveSelfId = Reflect.get(supervisor, 'resolveSelfId')
+        if (typeof resolveSelfId !== 'function') {
+            throw new Error('resolveSelfId is unavailable')
+        }
+
+        const hydrateEngineManager = Reflect.get(supervisor, 'hydrateEngineManager')
+        if (typeof hydrateEngineManager !== 'function') {
+            throw new Error('hydrateEngineManager is unavailable')
+        }
+
+        // Production startup resolves identity before engine hydration.
+        await Reflect.apply(resolveSelfId, supervisor, [])
+        expect(selfId).toBe(resolvedId)
+        expect(callProxy).not.toHaveBeenCalled()
+
+        // Proxy readiness can also precede hydration. No bridge is possible yet
+        // because the desired running state and backend port are unknown.
+        proxyPort = 18435
+        supervisor.handleNotification({
+            source: 'llamacpp-proxy',
+            method: 'ready',
+            params: { port: 18435 }
+        })
+        await Promise.resolve()
+        expect(callProxy).not.toHaveBeenCalled()
+
+        // Hydration supplies running=true and port=18434 and must itself trigger
+        // the bridge without waiting for engine:state-changed.
+        await Reflect.apply(hydrateEngineManager, supervisor, [])
+
+        await vi.waitFor(() => {
+            expect(callProxy).toHaveBeenCalledTimes(1)
+        })
+        expect(callProxy).toHaveBeenCalledWith('llamacpp', 'node/add-manual', {
+            id: resolvedId,
+            host: '127.0.0.1',
+            port: 18434,
+            addresses: ['127.0.0.1']
+        })
+
+        const localBridges = Reflect.get(supervisor, 'localBridges')
+        if (!(localBridges instanceof Map)) {
+            throw new Error('localBridges is unavailable')
+        }
+
+        await vi.waitFor(() => {
+            const bridge = localBridges.get('llamacpp')
+            if (typeof bridge !== 'object' || bridge === null) {
+                throw new Error('llama.cpp local bridge is unavailable')
+            }
+            expect(Reflect.get(bridge, 'bridgedId')).toBe(resolvedId)
+            expect(Reflect.get(bridge, 'bridgedPort')).toBe(18434)
+        })
+
+        // Repeating authoritative hydration remains idempotent.
+        await Reflect.apply(hydrateEngineManager, supervisor, [])
         await Promise.resolve()
 
         expect(callProxy).toHaveBeenCalledTimes(1)
