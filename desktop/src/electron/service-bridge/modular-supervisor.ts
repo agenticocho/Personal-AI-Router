@@ -281,13 +281,35 @@ type ModularRuntimeBinaryDefinition = (typeof MODULAR_RUNTIME_BINARIES)[number]
 interface LocalEngineBridge {
     running: boolean
     port: number
+    modelNames: string[]
+    modelNamesKnown: boolean
     bridgedId: string
     bridgedPort: number
+    bridgedModelNames: string[]
+    bridgedModelNamesKnown: boolean
+    revision: number
+    reconcileChain: Promise<void>
     selfWarned: boolean
 }
 
 function emptyLocalEngineBridge(): LocalEngineBridge {
-    return { running: false, port: 0, bridgedId: '', bridgedPort: 0, selfWarned: false }
+    return {
+        running: false,
+        port: 0,
+        modelNames: [],
+        modelNamesKnown: false,
+        bridgedId: '',
+        bridgedPort: 0,
+        bridgedModelNames: [],
+        bridgedModelNamesKnown: false,
+        revision: 0,
+        reconcileChain: Promise.resolve(),
+        selfWarned: false
+    }
+}
+
+function sameLocalBridgeModels(left: readonly string[], right: readonly string[]): boolean {
+    return left.length === right.length && left.every((model, index) => model === right[index])
 }
 
 /** Translate our `EngineType` into the engine-manager's engine id. */
@@ -1297,6 +1319,8 @@ class ModularSupervisor {
             const bridge = this.getLocalBridge(proxyEngine)
             bridge.bridgedId = ''
             bridge.bridgedPort = 0
+            bridge.bridgedModelNames = []
+            bridge.bridgedModelNamesKnown = false
             void this.reconcileLocalNodeBridge(proxyEngine)
             this.emitStateRefreshIfHydrated()
         }
@@ -2093,6 +2117,12 @@ class ModularSupervisor {
             this.cancelDiscoveryModelRefreshRetry(engine)
         }
         getModularBridgeState().setLocalEngineModels(engine, models)
+        if (isProxyEngine(engine)) {
+            const bridge = this.getLocalBridge(engine)
+            bridge.modelNames = [...models]
+            bridge.modelNamesKnown = true
+            void this.reconcileLocalNodeBridge(engine)
+        }
     }
 
     private scheduleDiscoveryModelRefreshRetry(engine: ProxyEngine): void {
@@ -2177,7 +2207,19 @@ class ModularSupervisor {
      * entry. Idempotent and safe to call repeatedly; re-bridges after a proxy
      * restart (which clears the proxy's manual set) via the `<proxy>:ready` hook.
      */
-    private async reconcileLocalNodeBridge(engine: ProxyEngine): Promise<void> {
+    private reconcileLocalNodeBridge(engine: ProxyEngine): Promise<void> {
+        const bridge = this.getLocalBridge(engine)
+        bridge.revision += 1
+        const revision = bridge.revision
+        const run = (): Promise<void> => this.reconcileLocalNodeBridgeRevision(engine, revision)
+        bridge.reconcileChain = bridge.reconcileChain.then(run, run)
+        return bridge.reconcileChain
+    }
+
+    private async reconcileLocalNodeBridgeRevision(
+        engine: ProxyEngine,
+        revision: number
+    ): Promise<void> {
         if (!this.processes.has('broker')) return
         const selfId = getModularBridgeState().getSelfId()
         // selfId not resolved yet — reconciliation is retried by engine state,
@@ -2185,6 +2227,10 @@ class ModularSupervisor {
         if (!selfId) return
 
         const bridge = this.getLocalBridge(engine)
+        if (revision !== bridge.revision) return
+        const desiredPort = bridge.port
+        const desiredModelNames = [...bridge.modelNames]
+        const desiredModelNamesKnown = bridge.modelNamesKnown
 
         // Never register the local node at the proxy's own listen port. The
         // proxy would forward requests to itself (127.0.0.1:proxyPort →
@@ -2197,15 +2243,15 @@ class ModularSupervisor {
         const proxyPort = getModularBridgeState().getProxyPort(engine)
         // Only a known, matching proxy port is a self-target; an unknown
         // (null) proxy port never blocks bridging.
-        const selfTarget = proxyPort !== null && bridge.port === proxyPort
-        if (selfTarget && bridge.port > 0) {
+        const selfTarget = proxyPort !== null && desiredPort === proxyPort
+        if (selfTarget && desiredPort > 0) {
             if (!bridge.selfWarned) {
                 bridge.selfWarned = true
                 log.warn({
                     sublevel: proxyRelayPrefix(engine),
                     message:
                         `Skipping local-node ${engine} proxy bridge: engine port ` +
-                        `${bridge.port} matches the proxy's own listen port ` +
+                        `${desiredPort} matches the proxy's own listen port ` +
                         '(would self-forward). Resolve the engine/proxy port collision.'
                 })
             }
@@ -2213,20 +2259,38 @@ class ModularSupervisor {
             bridge.selfWarned = false
         }
 
-        const shouldBridge = bridge.running && bridge.port > 0 && !selfTarget
+        const shouldBridge = bridge.running && desiredPort > 0 && !selfTarget
         if (shouldBridge) {
-            if (bridge.bridgedId === selfId && bridge.bridgedPort === bridge.port) {
+            if (
+                bridge.bridgedId === selfId &&
+                bridge.bridgedPort === desiredPort &&
+                bridge.bridgedModelNamesKnown === desiredModelNamesKnown &&
+                sameLocalBridgeModels(bridge.bridgedModelNames, desiredModelNames)
+            ) {
                 return
             }
             try {
-                await this.callProxy(engine, 'node/add-manual', {
-                    id: selfId,
-                    host: '127.0.0.1',
-                    port: bridge.port,
-                    addresses: ['127.0.0.1']
-                })
+                if (desiredModelNamesKnown) {
+                    await this.callProxy(engine, 'node/add-manual', {
+                        id: selfId,
+                        host: '127.0.0.1',
+                        port: desiredPort,
+                        addresses: ['127.0.0.1'],
+                        models: desiredModelNames
+                    })
+                } else {
+                    await this.callProxy(engine, 'node/add-manual', {
+                        id: selfId,
+                        host: '127.0.0.1',
+                        port: desiredPort,
+                        addresses: ['127.0.0.1']
+                    })
+                }
+                if (revision !== bridge.revision) return
                 bridge.bridgedId = selfId
-                bridge.bridgedPort = bridge.port
+                bridge.bridgedPort = desiredPort
+                bridge.bridgedModelNames = desiredModelNames
+                bridge.bridgedModelNamesKnown = desiredModelNamesKnown
             } catch (err) {
                 log.warn({
                     sublevel: proxyRelayPrefix(engine),
@@ -2240,6 +2304,8 @@ class ModularSupervisor {
             const previousId = bridge.bridgedId
             bridge.bridgedId = ''
             bridge.bridgedPort = 0
+            bridge.bridgedModelNames = []
+            bridge.bridgedModelNamesKnown = false
             try {
                 await this.callProxy(engine, 'node/remove-manual', { id: previousId })
             } catch (err) {

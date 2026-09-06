@@ -1355,6 +1355,37 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// overlayAuthoritativeLocalModels preserves subscribed transport and trust
+// metadata while replacing only Models when a same-ID manual record exactly
+// matches the current authoritative local backend. A qualifying empty list is
+// authoritative and clears stale subscribed capabilities.
+func (p *Proxy) overlayAuthoritativeLocalModels(
+	nodes []Node,
+	localTarget *url.URL,
+	hasLocalTarget bool,
+) []Node {
+	if !hasLocalTarget || localTarget == nil {
+		return nodes
+	}
+
+	out := append([]Node(nil), nodes...)
+	for i := range out {
+		manual, ok := p.discovery.Manual(out[i].ID)
+		if !ok || manual.Host == "" || manual.Port == 0 {
+			continue
+		}
+		manualTarget := &url.URL{
+			Scheme: "http",
+			Host:   net.JoinHostPort(manual.Host, strconv.Itoa(manual.Port)),
+		}
+		if !sameEndpoint(manualTarget, localTarget) {
+			continue
+		}
+		out[i].Models = append([]string{}, manual.Models...)
+	}
+	return out
+}
+
 // resolveCandidates returns the ordered list of nodes to try for the current
 // request. A model-bearing request first filters a request-local node copy to
 // advertised owners. A user-selected eligible node then leads, followed by
@@ -1367,6 +1398,24 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // Returns an empty slice when no forwarding target is available; the caller
 // treats that as the rejection path.
+// isManualCandidateEndpoint reports whether the already-selected candidate
+// endpoint exactly matches an endpoint from the manual record with the same ID.
+// ID equality alone is insufficient because a subscribed and manual record can
+// coexist under one ID while representing different transports.
+func (p *Proxy) isManualCandidateEndpoint(n Node, selected *url.URL) bool {
+	manual, ok := p.discovery.Manual(n.ID)
+	if !ok || selected == nil {
+		return false
+	}
+	for _, hostPort := range nodeCandidates(manual) {
+		manualEndpoint := &url.URL{Scheme: "http", Host: hostPort}
+		if sameEndpoint(selected, manualEndpoint) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Proxy) resolveCandidates(model string) []candidate {
 	p.selectedMu.RLock()
 	id := p.selectedID
@@ -1389,6 +1438,7 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 	p.mesh.Refresh()
 
 	nodes := p.discovery.Nodes()
+	nodes = p.overlayAuthoritativeLocalModels(nodes, localTarget, hasLocalTarget)
 	known := len(nodes)
 	if model != "" {
 		owners := make([]Node, 0, len(nodes))
@@ -1458,7 +1508,7 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 			// the relayed value can only ever disagree by being stale.
 			u.Scheme = "https"
 			peerUUID = n.ClusterUUID
-		case p.discovery.IsManual(n.ID):
+		case p.isManualCandidateEndpoint(n, u):
 			// An explicit user-added manual node: dialed plain to the address
 			// the user supplied (a deliberate, separately-labeled bypass).
 		default:

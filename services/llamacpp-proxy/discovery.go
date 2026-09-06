@@ -147,6 +147,21 @@ func (d *Discovery) AddManual(node Node) (added bool) {
 	return !exists
 }
 
+// Manual returns a defensive copy of the manual record keyed by id.
+func (d *Discovery) Manual(id string) (Node, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	node, ok := d.manualNodes[id]
+	if !ok {
+		return Node{}, false
+	}
+	node.Addresses = append([]string(nil), node.Addresses...)
+	node.TXT = append([]string(nil), node.TXT...)
+	node.Models = append([]string(nil), node.Models...)
+	return node, true
+}
+
 func (d *Discovery) RemoveManual(id string) (removed bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
