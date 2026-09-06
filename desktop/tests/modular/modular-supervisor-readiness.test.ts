@@ -10,8 +10,9 @@ import {
 const mocks = vi.hoisted(() => ({
     bridgeState: {
         handleNotification: vi.fn(),
-        getSelfId: vi.fn(() => null),
-        getProxyPort: vi.fn(() => null)
+        getSelfId: vi.fn<() => string | null>(() => null),
+        getProxyPort: vi.fn<() => number | null>(() => null),
+        setSelfId: vi.fn<(id: string) => void>()
     },
     emitBridgePush: vi.fn()
 }))
@@ -54,7 +55,7 @@ vi.mock('@/electron/service-bridge/modular-state', () => ({
     isUpstreamUnreachableError: () => false,
     parseServiceErrors: () => [],
     parseWorkloadsInitial: () => [],
-    PROXY_ENGINES: ['ollama', 'lm-studio']
+    PROXY_ENGINES: ['ollama', 'lm-studio', 'llamacpp']
 }))
 
 import {
@@ -168,6 +169,101 @@ describe('modular supervisor readiness', () => {
 
         expect(supervisor.ready).toBe(true)
         expect(onReady).toHaveBeenCalledOnce()
+    })
+
+    it('re-bridges a running local engine when self identity resolves after startup', async () => {
+        const resolvedId = '7a6c3d78-58f7-4b1f-a88a-5e3c8fdc9f19'
+        let selfId: string | null = null
+        let proxyPort: number | null = null
+        let settleFirstRelay = () => {}
+
+        const firstRelay = new Promise<void>(resolve => {
+            settleFirstRelay = resolve
+        })
+        const callProxy = vi.fn(() => firstRelay)
+
+        mocks.bridgeState.getSelfId.mockImplementation(() => selfId)
+        mocks.bridgeState.getProxyPort.mockImplementation(() => proxyPort)
+        mocks.bridgeState.setSelfId.mockImplementation((id: string) => {
+            selfId = id
+        })
+
+        Reflect.set(
+            supervisor,
+            'callProcess',
+            vi.fn(async (_name: string, method: string) => {
+                if (method === 'cluster:get-node-id') {
+                    return { nodeUuid: resolvedId }
+                }
+                throw new Error(`unexpected broker method ${method}`)
+            })
+        )
+        Reflect.set(supervisor, 'callProxy', callProxy)
+        supervisor.processes.set('broker', new JsonRpcSubprocess('broker', 'test-broker'))
+
+        const updateBridge = Reflect.get(supervisor, 'updateLocalNodeBridgeFromEngineState')
+        if (typeof updateBridge !== 'function') {
+            throw new Error('updateLocalNodeBridgeFromEngineState is unavailable')
+        }
+
+        // Engine state, proxy readiness, and broker readiness all arrive while
+        // identity is absent. Each bridge trigger must remain dormant.
+        Reflect.apply(updateBridge, supervisor, [
+            { engine: 'llamacpp', running: true, port: 18434 }
+        ])
+
+        proxyPort = 18435
+        supervisor.handleNotification({
+            source: 'llamacpp-proxy',
+            method: 'ready',
+            params: { port: 18435 }
+        })
+
+        notify('app:ready')
+        await Promise.resolve()
+
+        expect(callProxy).not.toHaveBeenCalled()
+
+        const resolveSelfId = Reflect.get(supervisor, 'resolveSelfId')
+        if (typeof resolveSelfId !== 'function') {
+            throw new Error('resolveSelfId is unavailable')
+        }
+
+        await Reflect.apply(resolveSelfId, supervisor, [])
+
+        await vi.waitFor(() => {
+            expect(callProxy).toHaveBeenCalledTimes(1)
+        })
+        expect(callProxy).toHaveBeenCalledWith('llamacpp', 'node/add-manual', {
+            id: resolvedId,
+            host: '127.0.0.1',
+            port: 18434,
+            addresses: ['127.0.0.1']
+        })
+
+        // Production deliberately keeps reconciliation fire-and-forget. Resolve
+        // the mocked RPC, then wait for reconcileLocalNodeBridge to record its
+        // bridged ID and port before testing repeated identity resolution.
+        settleFirstRelay()
+
+        const localBridges = Reflect.get(supervisor, 'localBridges')
+        if (!(localBridges instanceof Map)) {
+            throw new Error('localBridges is unavailable')
+        }
+
+        await vi.waitFor(() => {
+            const bridge = localBridges.get('llamacpp')
+            if (typeof bridge !== 'object' || bridge === null) {
+                throw new Error('llama.cpp local bridge is unavailable')
+            }
+            expect(Reflect.get(bridge, 'bridgedId')).toBe(resolvedId)
+            expect(Reflect.get(bridge, 'bridgedPort')).toBe(18434)
+        })
+
+        await Reflect.apply(resolveSelfId, supervisor, [])
+        await Promise.resolve()
+
+        expect(callProxy).toHaveBeenCalledTimes(1)
     })
 
     it('ignores readiness from a replaced broker generation', () => {

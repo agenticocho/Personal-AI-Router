@@ -1554,7 +1554,14 @@ class ModularSupervisor {
             const identity = parseNodeIdentity(
                 await this.callProcess('broker', 'cluster:get-node-id')
             )
-            if (identity.nodeUuid) getModularBridgeState().setSelfId(identity.nodeUuid)
+            if (identity.nodeUuid) {
+                getModularBridgeState().setSelfId(identity.nodeUuid)
+                // Self-ID resolution is also a bridge trigger: engine, proxy, and
+                // broker readiness may all precede this stable UUID.
+                for (const engine of PROXY_ENGINES) {
+                    void this.reconcileLocalNodeBridge(engine)
+                }
+            }
         } catch (err) {
             log.verbose({
                 sublevel: 'broker',
@@ -2169,8 +2176,8 @@ class ModularSupervisor {
     private async reconcileLocalNodeBridge(engine: ProxyEngine): Promise<void> {
         if (!this.processes.has('broker')) return
         const selfId = getModularBridgeState().getSelfId()
-        // selfId not resolved yet — reconcile re-runs on the next trigger
-        // (engine:state-changed, proxy ready, broker ready).
+        // selfId not resolved yet — reconciliation is retried by engine state,
+        // proxy ready, broker ready, or successful self-ID resolution.
         if (!selfId) return
 
         const bridge = this.getLocalBridge(engine)

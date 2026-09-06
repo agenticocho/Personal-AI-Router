@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	"nvpair-shared/appdir"
+	"nvpair-shared/clustertrust"
+	"nvpair-shared/clustertrusttest"
 )
 
 func redirectLocalAuthConfig(t *testing.T) string {
@@ -271,6 +273,332 @@ func TestResolveCandidatesMarksOnlySelfLocal(t *testing.T) {
 	}
 	if localCount != 1 {
 		t.Fatalf("local candidate count = %d, want 1", localCount)
+	}
+}
+
+func TestSameEndpointUsesStrictTextualIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		a    string
+		b    string
+		want bool
+	}{
+		{
+			name: "scheme case and terminal dot normalize",
+			a:    "HTTP://Example.COM.:80",
+			b:    "http://example.com",
+			want: true,
+		},
+		{
+			name: "https default port",
+			a:    "https://example.com",
+			b:    "HTTPS://EXAMPLE.COM:443",
+			want: true,
+		},
+		{
+			name: "same host different port",
+			a:    "http://127.0.0.1:18434",
+			b:    "http://127.0.0.1:18435",
+			want: false,
+		},
+		{
+			name: "different textual loopback host",
+			a:    "http://127.0.0.1:18434",
+			b:    "http://localhost:18434",
+			want: false,
+		},
+		{
+			name: "different loopback family",
+			a:    "http://127.0.0.1:18434",
+			b:    "http://[::1]:18434",
+			want: false,
+		},
+		{
+			name: "unknown scheme without ports",
+			a:    "custom://example.com",
+			b:    "CUSTOM://EXAMPLE.COM",
+			want: false,
+		},
+		{
+			name: "unknown scheme with explicit equal ports",
+			a:    "custom://example.com:9000",
+			b:    "CUSTOM://EXAMPLE.COM:9000",
+			want: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a, err := url.Parse(test.a)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := url.Parse(test.b)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := sameEndpoint(a, b); got != test.want {
+				t.Fatalf(
+					"sameEndpoint(%q, %q) = %t, want %t",
+					test.a,
+					test.b,
+					got,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
+func directLocalRoutingProxy(t *testing.T, backendURL, model string) *Proxy {
+	t.Helper()
+
+	backend, err := url.Parse(backendURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	port, err := strconv.Atoi(backend.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	discovery := NewDiscovery()
+	discovery.AddManual(nodeForModel(t, "direct-local", backendURL, model))
+
+	proxy := testProxy(discovery, 18435)
+	proxy.setLocalBackend(localBackend{
+		Engine:  "llamacpp",
+		Host:    backend.Hostname(),
+		Port:    port,
+		Healthy: true,
+	})
+	return proxy
+}
+
+func TestResolveCandidatesMarksExactDirectLocal(t *testing.T) {
+	discovery := NewDiscovery()
+	discovery.AddManual(Node{
+		ID:        "direct-local",
+		Addresses: []string{"127.0.0.1"},
+		Port:      18434,
+	})
+	discovery.AddManual(Node{
+		ID:        "same-host-different-port",
+		Addresses: []string{"127.0.0.1"},
+		Port:      19001,
+	})
+	discovery.AddManual(Node{
+		ID:        "different-textual-host",
+		Addresses: []string{"localhost"},
+		Port:      18434,
+	})
+
+	proxy := testProxy(discovery, 18435)
+	proxy.setLocalBackend(localBackend{
+		Engine:  "llamacpp",
+		Host:    "127.0.0.1",
+		Port:    18434,
+		Healthy: true,
+	})
+
+	candidates := proxy.resolveCandidates("")
+	if len(candidates) != 3 {
+		t.Fatalf("candidates = %#v, want 3", candidates)
+	}
+
+	for _, candidate := range candidates {
+		switch candidate.id {
+		case "direct-local":
+			if !candidate.local {
+				t.Fatal("exact direct local backend was not marked local")
+			}
+			if candidate.url.Scheme != "http" ||
+				candidate.url.Host != "127.0.0.1:18434" {
+				t.Fatalf(
+					"direct local URL = %s, want authoritative http://127.0.0.1:18434",
+					candidate.url.String(),
+				)
+			}
+			if candidate.peerUUID != "" {
+				t.Fatalf(
+					"direct local peer UUID = %q, want empty",
+					candidate.peerUUID,
+				)
+			}
+		case "same-host-different-port", "different-textual-host":
+			if candidate.local {
+				t.Fatalf(
+					"non-exact candidate %q was incorrectly marked local",
+					candidate.id,
+				)
+			}
+		default:
+			t.Fatalf("unexpected candidate %q", candidate.id)
+		}
+	}
+}
+
+func TestResolveCandidatesRemoteMTLSRemainsNonLocal(t *testing.T) {
+	const peerUUID = "principal-peer"
+	clusterDir := filepath.Join(t.TempDir(), "cluster")
+
+	discovery := NewDiscovery()
+	discovery.SetSubscribed([]Node{{
+		ID:          "remote-peer",
+		Host:        "remote-peer",
+		Port:        18435,
+		Addresses:   []string{"192.0.2.10"},
+		IP:          "192.0.2.10",
+		ClusterUUID: peerUUID,
+	}})
+
+	proxy := testProxy(discovery, 18435)
+	proxy.mesh = clustertrust.Open(clusterDir)
+	clustertrusttest.Join(
+		t,
+		clusterDir,
+		"cluster-xyz",
+		"principal-self",
+		peerUUID,
+	)
+
+	candidates := proxy.resolveCandidates("")
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %#v, want one pinned remote peer", candidates)
+	}
+
+	candidate := candidates[0]
+	if candidate.id != "remote-peer" {
+		t.Fatalf("candidate ID = %q, want remote-peer", candidate.id)
+	}
+	if candidate.local {
+		t.Fatal("remote mTLS candidate was incorrectly marked local")
+	}
+	if candidate.peerUUID != peerUUID {
+		t.Fatalf(
+			"remote peer UUID = %q, want %q",
+			candidate.peerUUID,
+			peerUUID,
+		)
+	}
+	if candidate.url.Scheme != "https" {
+		t.Fatalf(
+			"remote candidate scheme = %q, want https",
+			candidate.url.Scheme,
+		)
+	}
+}
+
+func TestResolveCandidatesFacadeSelfWithoutBackendIsUnroutable(t *testing.T) {
+	discovery := NewDiscovery()
+	discovery.AddManual(Node{
+		ID:        "self",
+		Addresses: []string{"127.0.0.1"},
+		Port:      18435,
+	})
+
+	proxy := testProxy(discovery, 18435)
+	if candidates := proxy.resolveCandidates(""); len(candidates) != 0 {
+		t.Fatalf(
+			"candidates = %#v, want none without a healthy local backend",
+			candidates,
+		)
+	}
+}
+
+func TestHandleHTTPDirectLocalModelListUsesDestinationAuth(t *testing.T) {
+	configPath := redirectLocalAuthConfig(t)
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	writeLocalAuthToken(t, tokenPath, "destination-token")
+	writeLocalAuthConfig(t, configPath, tokenPath)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer destination-token" {
+			t.Error("direct local model-list request lacked destination authorization")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Header.Get("Cookie") != "" {
+			t.Error("caller cookie reached direct local model-list backend")
+		}
+		if r.Header.Get("Connection") != "" {
+			t.Error("Connection header reached direct local model-list backend")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(
+			[]byte(`{"object":"list","data":[{"id":"direct-local"}]}`),
+		)
+	}))
+	defer backend.Close()
+
+	proxy := directLocalRoutingProxy(t, backend.URL, "direct-local-model")
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request.Header.Set("Connection", "Authorization")
+	request.Header.Set("Authorization", "Bearer caller-token")
+	request.Header.Set("Cookie", "session=caller-cookie")
+	recorder := httptest.NewRecorder()
+
+	proxy.handleHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "direct-local") {
+		t.Fatalf(
+			"model-list body = %q, want direct-local model",
+			recorder.Body.String(),
+		)
+	}
+}
+
+func TestHandleHTTPDirectLocalInferenceUsesDestinationAuth(t *testing.T) {
+	configPath := redirectLocalAuthConfig(t)
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	writeLocalAuthToken(t, tokenPath, "destination-token")
+	writeLocalAuthConfig(t, configPath, tokenPath)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := r.Header.Get("Authorization")
+		if authorization != "Bearer destination-token" {
+			t.Error("direct local inference lacked destination authorization")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if strings.Contains(authorization, "caller-token") {
+			t.Error("caller authorization survived direct local replacement")
+		}
+		if r.Header.Get("Cookie") != "" {
+			t.Error("caller cookie reached direct local inference backend")
+		}
+		if r.Header.Get("Connection") != "" {
+			t.Error("Connection header reached direct local inference backend")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(
+			[]byte(`{"choices":[{"message":{"content":"ok"}}]}`),
+		)
+	}))
+	defer backend.Close()
+
+	proxy := directLocalRoutingProxy(t, backend.URL, "direct-local-model")
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"direct-local-model"}`),
+	)
+	request.Header.Set("Connection", "Authorization")
+	request.Header.Set("Authorization", "Bearer caller-token")
+	request.Header.Set("Cookie", "session=caller-cookie")
+	recorder := httptest.NewRecorder()
+
+	proxy.handleHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
 }
 

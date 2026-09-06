@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1134,6 +1135,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// Each candidate receives an isolated request and Header map. A local
 		// credential must never survive into a later remote/manual failover.
 		upstreamRequest := r.Clone(r.Context())
+		if cand.local {
+			// Browser/session credentials belong to the caller-facing facade,
+			// never the destination-local engine. Mutate only this candidate's
+			// clone so a later remote/manual failover retains the caller headers.
+			upstreamRequest.Header.Del("Cookie")
+		}
 		if bodyBytes != nil {
 			upstreamRequest.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
@@ -1371,6 +1378,10 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 	selfPort := p.port
 	p.httpMu.Unlock()
 
+	// Snapshot the authoritative local backend once for this resolution pass.
+	// Candidate classification must not observe a different backend mid-pass.
+	localTarget, hasLocalTarget := p.localBackendTarget()
+
 	// Re-derive membership and pins before resolving so a cluster joined or left,
 	// and a peer paired or removed, since the last request is reflected without a
 	// restart: a removed peer stops being a routable candidate immediately, and a
@@ -1423,12 +1434,17 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 			// it from the explicit local backend — the loopback engine — rather
 			// than dialing our own mTLS ingress, which would recurse. Ranking
 			// still used this node's real (discovered) model list above.
-			lb, ok := p.localBackendTarget()
-			if !ok {
+			if !hasLocalTarget {
 				slog.Debug("resolveCandidates: no local backend for self", "node_id", n.ID)
 				return
 			}
-			u = lb
+			u = localTarget
+			local = true
+		case hasLocalTarget && sameEndpoint(u, localTarget):
+			// Desktop's fallback bridge registers the real engine endpoint,
+			// not this proxy facade. Use the authoritative snapshot and mark
+			// only this exact endpoint local so destination auth is applied.
+			u = localTarget
 			local = true
 		case p.mesh.HasPin(n.ClusterUUID):
 			// A pinned cluster peer: reach it only over mTLS to its promoted
@@ -1570,6 +1586,50 @@ func nodeAdvertisesModel(n Node, model string) bool {
 		}
 	}
 	return false
+}
+
+// normalizedEndpointHost performs textual hostname normalization only. It
+// deliberately does not resolve names or equate different loopback spellings.
+func normalizedEndpointHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+// effectiveEndpointPort returns an explicit numeric port, or the standard port
+// for the only schemes whose defaults this proxy recognizes. Unknown schemes
+// without an explicit port are intentionally incomparable.
+func effectiveEndpointPort(u *url.URL) (int, bool) {
+	if portText := u.Port(); portText != "" {
+		port, err := strconv.Atoi(portText)
+		if err != nil {
+			return 0, false
+		}
+		return port, true
+	}
+
+	switch {
+	case strings.EqualFold(u.Scheme, "http"):
+		return 80, true
+	case strings.EqualFold(u.Scheme, "https"):
+		return 443, true
+	default:
+		return 0, false
+	}
+}
+
+// sameEndpoint reports exact textual endpoint identity without DNS lookup or
+// broad loopback equivalence. 127.0.0.1, localhost, and ::1 remain distinct
+// unless their normalized host strings are identical.
+func sameEndpoint(a, b *url.URL) bool {
+	if !strings.EqualFold(a.Scheme, b.Scheme) {
+		return false
+	}
+	if normalizedEndpointHost(a.Hostname()) != normalizedEndpointHost(b.Hostname()) {
+		return false
+	}
+
+	aPort, aOK := effectiveEndpointPort(a)
+	bPort, bOK := effectiveEndpointPort(b)
+	return aOK && bOK && aPort == bPort
 }
 
 // isSelfTarget reports whether u points back at this proxy's own listener.
