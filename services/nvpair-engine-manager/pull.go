@@ -101,6 +101,9 @@ func (e *Executor) PullModelStream(ctx context.Context, engine, model string, pa
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := applyActionHTTPAuthorization(req, st.plat.Runtime.BearerTokenFile); err != nil {
+		return nil, fmt.Errorf("pull %q authentication: %w", model, err)
+	}
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("pull %q: %w", model, err)

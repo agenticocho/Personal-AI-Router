@@ -125,6 +125,9 @@ func (e *Executor) dispatchAction(ctx context.Context, st *engineState, engine, 
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set(engineIdentityProbeHeader, "1")
+	if err := applyActionHTTPAuthorization(req, st.plat.Runtime.BearerTokenFile); err != nil {
+		return nil, fmt.Errorf("action %q authentication: %w", action, err)
+	}
 	client := e.client
 	if engine == "ollama" && action == "run_model" && e.ollamaLoadClient != nil {
 		client = e.ollamaLoadClient
