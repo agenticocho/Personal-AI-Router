@@ -700,6 +700,7 @@ type candidate struct {
 	id       string
 	url      *url.URL
 	peerUUID string
+	local    bool
 }
 
 // candidateTransport returns the reverse-proxy / model-list transport for a
@@ -834,6 +835,12 @@ func (p *Proxy) serveModelList(w http.ResponseWriter, r *http.Request, candidate
 			continue
 		}
 		upstream.Header.Set("Accept", "application/json")
+		if cand.local {
+			if err := applyLocalBackendAuthorization(upstream); err != nil {
+				results[i].err = err
+				continue
+			}
+		}
 
 		// A cluster-peer candidate is queried over mTLS to its promoted proxy;
 		// self/manual candidates use the shared plain client.
@@ -1123,11 +1130,20 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	for i := range candidates {
 		cand := candidates[i]
 		last := i == len(candidates)-1
+
+		// Each candidate receives an isolated request and Header map. A local
+		// credential must never survive into a later remote/manual failover.
+		upstreamRequest := r.Clone(r.Context())
 		if bodyBytes != nil {
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			upstreamRequest.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 		retry := false
 		sc := &statusCapture{ResponseWriter: w, status: http.StatusOK, idle: idleClientWriteTimeout}
+
+		var transport http.RoundTripper = p.candidateTransport(cand)
+		if cand.local {
+			transport = withLocalBackendAuthorization(transport)
+		}
 
 		proxy := &httputil.ReverseProxy{
 			Director: func(req *http.Request) {
@@ -1137,7 +1153,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 			// A remote cluster peer is dialed over mTLS (per-peer pinned config);
 			// self/manual candidates use the plain transport. See candidateTransport.
-			Transport: p.candidateTransport(cand),
+			Transport: transport,
 			// ModifyResponse fires when the upstream's status line + headers
 			// have arrived but before the body streams. That's both the retry
 			// decision point and, on commit, the time-to-first-byte boundary.
@@ -1208,6 +1224,22 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				if _, ok := err.(retrySignal); ok {
 					return // retryable status — the loop advances to the next candidate
 				}
+				if isLocalBackendAuthenticationError(err) {
+					proxyErr = errLocalBackendAuthentication.Error()
+					if !last {
+						retry = true
+						return
+					}
+					servedNodeID = cand.id
+					servedTarget = cand.url.Host
+					writeIngressError(
+						ew,
+						http.StatusServiceUnavailable,
+						"backend-unavailable",
+						"local inference backend is unavailable",
+					)
+					return
+				}
 				// Transport/dial error (not a status-based retry): forget this
 				// node's confirmed address so the next request re-confirms and
 				// can fail over to another of its published addresses
@@ -1249,7 +1281,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 
-		proxy.ServeHTTP(sc, r)
+		proxy.ServeHTTP(sc, upstreamRequest)
 		if !retry {
 			finalStatus = sc.status
 			committedSC = sc
@@ -1384,6 +1416,7 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 			return
 		}
 		peerUUID := ""
+		local := false
 		switch {
 		case isSelfTarget(u, selfPort):
 			// Our own advertised endpoint (lm now points at this proxy). Serve
@@ -1396,6 +1429,7 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 				return
 			}
 			u = lb
+			local = true
 		case p.mesh.HasPin(n.ClusterUUID):
 			// A pinned cluster peer: reach it only over mTLS to its promoted
 			// proxy (the lm port now advertises the proxy, not the engine).
@@ -1433,6 +1467,7 @@ func (p *Proxy) resolveCandidates(model string) []candidate {
 			id:       n.ID,
 			url:      u,
 			peerUUID: peerUUID,
+			local:    local,
 		})
 	}
 

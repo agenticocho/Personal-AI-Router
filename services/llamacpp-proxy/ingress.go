@@ -128,8 +128,17 @@ func (p *Proxy) newLocalReverseProxy(target *url.URL) *httputil.ReverseProxy {
 			req.URL.Host = target.Host
 			req.Host = target.Host
 		},
-		Transport: p.plainHTTPTransport(),
+		Transport: withLocalBackendAuthorization(p.plainHTTPTransport()),
 		ErrorHandler: func(ew http.ResponseWriter, _ *http.Request, err error) {
+			if isLocalBackendAuthenticationError(err) {
+				writeIngressError(
+					ew,
+					http.StatusServiceUnavailable,
+					"backend-unavailable",
+					"local inference backend is unavailable",
+				)
+				return
+			}
 			slog.Warn("cluster ingress upstream error", "target", target.Host, "err", err)
 			writeIngressError(ew, http.StatusBadGateway, "backend-error", "local inference backend error")
 		},
