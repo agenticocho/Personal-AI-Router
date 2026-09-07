@@ -153,26 +153,62 @@ function booleanValue(value: JsonValue | undefined): boolean {
  * Extract model names from a `nvpair-engine-manager` `list_models` action result.
  * The action returns the engine's raw response, which differs per engine:
  * Ollama's `/api/tags` yields `{ models: [{ name }] }`, LM Studio's native
- * `/api/v1/models` yields `{ models: [{ key }] }`. A present empty array is
- * authoritative; a missing or malformed inventory throws so callers retain or
- * fall back to their last-good source instead of silently clearing it.
+ * `/api/v1/models` yields `{ models: [{ key }] }`, and OpenAI-compatible
+ * llama.cpp yields `{ data: [{ id }] }`. A present recognized empty array is
+ * authoritative; missing or malformed recognized arrays throw so callers retain
+ * or fall back to their last-good source instead of silently clearing it.
  */
 export function parseListModelNames(result: JsonValue | undefined): string[] {
     const obj = objectValue(result)
     if (!obj) throw new Error('list_models returned a non-object response')
-    const names: string[] = []
-    if (Array.isArray(obj.models)) {
-        for (const entry of obj.models) {
-            const row = objectValue(entry)
-            const name = stringValue(row?.name) || stringValue(row?.key)
-            if (name) names.push(name)
-        }
-        if (obj.models.length > 0 && names.length === 0) {
-            throw new Error('list_models returned no usable model names')
-        }
-        return names
+
+    const hasModels = Object.prototype.hasOwnProperty.call(obj, 'models')
+    const hasData = Object.prototype.hasOwnProperty.call(obj, 'data')
+    if (!hasModels && !hasData) {
+        throw new Error('list_models response is missing both models and data arrays')
     }
-    throw new Error('list_models response is missing its model array')
+
+    const parseRows = (value: JsonValue | undefined, shape: 'models' | 'data'): string[] => {
+        if (!Array.isArray(value)) {
+            throw new Error(`list_models ${shape} field must be an array`)
+        }
+
+        const identifiers: string[] = []
+        for (const entry of value) {
+            const row = objectValue(entry)
+            if (!row) continue
+
+            const identifier =
+                shape === 'data'
+                    ? stringValue(row.id)
+                    : stringValue(row.name) || stringValue(row.key)
+
+            if (identifier) identifiers.push(identifier)
+        }
+
+        if (value.length > 0 && identifiers.length === 0) {
+            throw new Error(`list_models ${shape} array contains no usable identifiers`)
+        }
+
+        return identifiers
+    }
+
+    const modelIdentifiers = hasModels ? parseRows(obj.models, 'models') : null
+    const dataIdentifiers = hasData ? parseRows(obj.data, 'data') : null
+
+    if (modelIdentifiers !== null && dataIdentifiers !== null) {
+        const identical =
+            modelIdentifiers.length === dataIdentifiers.length &&
+            modelIdentifiers.every((identifier, index) => identifier === dataIdentifiers[index])
+
+        if (!identical) {
+            throw new Error('list_models response contains conflicting models and data arrays')
+        }
+
+        return modelIdentifiers
+    }
+
+    return modelIdentifiers ?? dataIdentifiers ?? []
 }
 
 /**

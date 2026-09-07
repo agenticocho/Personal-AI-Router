@@ -26,8 +26,12 @@ describe('LM Studio model reconciliation', () => {
             })
         ).toEqual(['lmstudio-community/phi-3', 'lmstudio-community/gemma-2b'])
         expect(parseListModelNames({ models: [] })).toEqual([])
-        expect(() => parseListModelNames({ models: null })).toThrow('missing its model array')
-        expect(() => parseListModelNames({ models: [{}] })).toThrow('no usable model names')
+        expect(() => parseListModelNames({ models: null })).toThrow(
+            'list_models models field must be an array'
+        )
+        expect(() => parseListModelNames({ models: [{}] })).toThrow(
+            'list_models models array contains no usable identifiers'
+        )
     })
 
     it('keeps a successful empty local inventory instead of reviving discovery data', () => {

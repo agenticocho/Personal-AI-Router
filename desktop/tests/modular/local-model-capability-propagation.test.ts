@@ -80,6 +80,76 @@ function payloadMatches(
     )
 }
 
+describe('parseListModelNames strict inventory shapes', () => {
+    const exact = 'DeepSeek-V4-Pro-Qwen3.5-4B-MTP-Q4_K_M'
+    const compact = 'DeepSeek-V4-Pro-Qwen3.5-4B-MTP-Q4KM'
+
+    it('accepts exact OpenAI data identifiers', () => {
+        expect(parseListModelNames({ data: [{ id: exact }] })).toEqual([exact])
+    })
+
+    it('accepts authoritative empty arrays', () => {
+        expect(parseListModelNames({ data: [] })).toEqual([])
+        expect(parseListModelNames({ models: [] })).toEqual([])
+    })
+
+    it('preserves models name and key compatibility', () => {
+        expect(
+            parseListModelNames({
+                models: [{ name: exact }, { key: compact }]
+            })
+        ).toEqual([exact, compact])
+    })
+
+    it('skips malformed rows when a usable identifier remains', () => {
+        expect(
+            parseListModelNames({
+                data: [null, { id: 42 }, { id: exact }]
+            })
+        ).toEqual([exact])
+    })
+
+    it('rejects nonempty arrays with no usable identifiers', () => {
+        expect(() => parseListModelNames({ data: [null, { id: 42 }] })).toThrow(
+            'contains no usable identifiers'
+        )
+    })
+
+    it('rejects missing, null, and wrong-typed arrays', () => {
+        expect(() => parseListModelNames({})).toThrow('missing both models and data arrays')
+        expect(() => parseListModelNames({ data: null })).toThrow('data field must be an array')
+        expect(() => parseListModelNames({ models: 'invalid' })).toThrow(
+            'models field must be an array'
+        )
+    })
+
+    it('rejects conflicting dual shapes', () => {
+        expect(() =>
+            parseListModelNames({
+                models: [{ name: exact }],
+                data: [{ id: compact }]
+            })
+        ).toThrow('conflicting models and data arrays')
+    })
+
+    it('accepts identical deterministic dual shapes', () => {
+        expect(
+            parseListModelNames({
+                models: [{ name: exact }],
+                data: [{ id: exact }]
+            })
+        ).toEqual([exact])
+    })
+
+    it('preserves punctuation-distinct identifiers byte-for-byte', () => {
+        expect(
+            parseListModelNames({
+                data: [{ id: compact }, { id: exact }]
+            })
+        ).toEqual([compact, exact])
+    })
+})
+
 describe('local model capability propagation', () => {
     const supervisor = getModularSupervisor()
     const state = getModularBridgeState()
@@ -299,5 +369,18 @@ describe('local model capability propagation', () => {
 
         expect(nodeAdds()).toHaveLength(1)
         expect(payloadMatches(nodeAdds()[0], SELF_ID, 18434, [MODEL_A])).toBe(true)
+    })
+
+    it('commits raw OpenAI inventory into node/add-manual', async () => {
+        const exact = 'DeepSeek-V4-Pro-Qwen3.5-4B-MTP-Q4_K_M'
+        const rawActionResponse = {
+            object: 'list',
+            data: [{ id: exact, object: 'model', owned_by: 'llamacpp' }]
+        }
+
+        await commitInventory(parseListModelNames(rawActionResponse))
+
+        expect(nodeAdds()).toHaveLength(1)
+        expect(payloadModels(nodeAdds()[0])).toEqual([exact])
     })
 })
