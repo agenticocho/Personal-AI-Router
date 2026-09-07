@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"nvpair-shared/noderec"
@@ -212,7 +214,7 @@ func (b *Broker) reconcileAdvertiseLlamaCpp(client *http.Client) {
 	up := probe &&
 		proxyPort != 0 &&
 		enginePort != proxyPort &&
-		checkLMStudioHealth(client, enginePort)
+		checkLlamaCppHealth(client, enginePort)
 
 	if up {
 		b.registerService(noderec.RegisterParams{
@@ -349,5 +351,19 @@ func checkLMStudioHealth(client *http.Client, port int) bool {
 		return false
 	}
 	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// checkLlamaCppHealth reports whether a local llama.cpp server is healthy.
+// llama.cpp's /health endpoint is deliberately unauthenticated; /v1/models
+// may require the destination bearer credential and must remain owned by the
+// engine manager and llamacpp-proxy, not this broker liveness check.
+func checkLlamaCppHealth(client *http.Client, port int) bool {
+	endpoint := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(port)) + "/health"
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
 }

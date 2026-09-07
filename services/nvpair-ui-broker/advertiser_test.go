@@ -6,6 +6,9 @@ package main
 import (
 	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -207,4 +210,89 @@ func TestOllamaFacadeIsPendingBackend(t *testing.T) {
 	if !b.ollamaFacadeIsPendingBackend() {
 		t.Fatal("recovery must keep probes blocked until the proxy vacates 11434")
 	}
+}
+
+func TestCheckLlamaCppHealthUsesUnauthenticatedHealthEndpoint(t *testing.T) {
+	status := http.StatusOK
+	requests := 0
+	modelRequests := 0
+	serverAddr := ""
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %q, want GET", r.Method)
+		}
+		if r.URL.Path != "/health" {
+			t.Errorf("path = %q, want /health", r.URL.Path)
+		}
+		if r.URL.Path == "/v1/models" {
+			modelRequests++
+		}
+		if r.Host != serverAddr {
+			t.Errorf("host = %q, want %q", r.Host, serverAddr)
+		}
+
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			t.Errorf("split host %q: %v", r.Host, err)
+		} else if host != "127.0.0.1" {
+			t.Errorf("host IP = %q, want 127.0.0.1", host)
+		}
+
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty", got)
+		}
+		if got := r.Header.Get("Cookie"); got != "" {
+			t.Errorf("Cookie = %q, want empty", got)
+		}
+
+		w.WriteHeader(status)
+	}))
+	serverAddr = srv.Listener.Addr().String()
+
+	host, portText, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		srv.Close()
+		t.Fatalf("split server address %q: %v", serverAddr, err)
+	}
+	if host != "127.0.0.1" {
+		srv.Close()
+		t.Fatalf("server host = %q, want 127.0.0.1", host)
+	}
+
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		srv.Close()
+		t.Fatalf("parse server port %q: %v", portText, err)
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	if !checkLlamaCppHealth(client, port) {
+		srv.Close()
+		t.Fatal("HTTP 200 returned false")
+	}
+
+	status = http.StatusServiceUnavailable
+	if checkLlamaCppHealth(client, port) {
+		srv.Close()
+		t.Fatal("HTTP 503 returned true")
+	}
+
+	if requests != 2 {
+		srv.Close()
+		t.Fatalf("request count = %d, want 2", requests)
+	}
+	if modelRequests != 0 {
+		srv.Close()
+		t.Fatalf("/v1/models request count = %d, want 0", modelRequests)
+	}
+
+	srv.Close()
+	if checkLlamaCppHealth(client, port) {
+		t.Fatal("connection failure returned true")
+	}
+
 }
