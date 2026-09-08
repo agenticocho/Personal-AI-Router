@@ -214,6 +214,9 @@ func isolateOllamaHostTestConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("LOCALAPPDATA", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
+	// macOS reads $HOME/Library/Application Support and ignores both vars
+	// above, so without this the test leaks state into the next run.
+	t.Setenv("HOME", dir)
 }
 
 func TestAliasWarningReplaysAfterErrorsProcessRecovery(t *testing.T) {

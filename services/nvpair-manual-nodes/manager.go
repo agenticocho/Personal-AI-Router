@@ -115,9 +115,18 @@ type ManualNodeStatus struct {
 	// LM Studio is probed on its default OpenAI-API port the same way Ollama
 	// is on 11434, so a manually-added node running LM Studio can be bridged
 	// into lmstudio-proxy by a supervising broker.
-	LMStudioUp     bool        `json:"lmstudio_up"`
-	LMStudioPort   int         `json:"lmstudio_port"`
-	LMStudioModels []string    `json:"lmstudio_models,omitempty"`
+	LMStudioUp     bool     `json:"lmstudio_up"`
+	LMStudioPort   int      `json:"lmstudio_port"`
+	LMStudioModels []string `json:"lmstudio_models,omitempty"`
+	// llama.cpp is read over the pin, on the port the AUTHENTICATED
+	// descriptor named: plaintext em refuses non-loopback callers, so a
+	// peer's inventory is trustworthy only over a connection whose far
+	// end proved it holds the principal's key. Populated on the accepted
+	// branch only; an absent or failed descriptor leaves all four zero.
+	LlamaCppUp     bool        `json:"llamacpp_up"`
+	LlamaCppPort   int         `json:"llamacpp_port"`
+	LlamaCppModels []string    `json:"llamacpp_models,omitempty"`
+	LlamaCppLoaded []string    `json:"llamacpp_loaded,omitempty"`
 	NodeInfoUp     bool        `json:"node_info_up"`
 	NodeInfoPort   int         `json:"node_info_port"`
 	TLSEnabled     bool        `json:"tls_enabled,omitempty"`
@@ -298,6 +307,9 @@ func (m *Manager) probeNode(entry ManualEntry) {
 			directConnectMemory.remember(id, *info.ClusterUUID)
 		}
 	}
+	var llamaCppUp bool
+	var llamaCppModels, llamaCppLoaded []string
+	llamaCppPort := 0
 	serviceMapValid := authOutcome == directConnectAccepted
 	switch authOutcome {
 	case directConnectAccepted:
@@ -312,11 +324,19 @@ func (m *Manager) probeNode(entry ManualEntry) {
 		} else {
 			lmStudioUp, lmStudioModels = false, nil
 		}
+		if port, ok := authServices[noderec.ServiceLlamaCpp]; ok {
+			llamaCppPort = port
+			llamaCppUp, llamaCppModels, llamaCppLoaded = m.probeLlamaCppAuthenticated(addr, principalFor(info), port)
+		} else {
+			llamaCppUp, llamaCppModels, llamaCppLoaded = false, nil, nil
+		}
 	case directConnectFailed:
 		// A peer that answered but could not be authenticated gets no claim at
 		// all: legacy probing would otherwise report it as usable.
 		ollamaUp, ollamaModels = false, nil
 		lmStudioUp, lmStudioModels = false, nil
+		llamaCppUp, llamaCppModels, llamaCppLoaded = false, nil, nil
+		llamaCppPort = 0
 		authServices = nil
 	}
 
@@ -330,6 +350,10 @@ func (m *Manager) probeNode(entry ManualEntry) {
 		LMStudioUp:      lmStudioUp,
 		LMStudioPort:    lmStudioPort,
 		LMStudioModels:  lmStudioModels,
+		LlamaCppUp:      llamaCppUp,
+		LlamaCppPort:    llamaCppPort,
+		LlamaCppModels:  llamaCppModels,
+		LlamaCppLoaded:  llamaCppLoaded,
 		NodeInfoUp:      nodeInfoUp,
 		NodeInfoPort:    nodeInfoPort,
 		TLSEnabled:      entry.TLSPort > 0,
@@ -388,7 +412,7 @@ func (m *Manager) probeNode(entry ManualEntry) {
 		!cpuEqual(prev.CPU, newStatus.CPU) ||
 		!memoryEqual(prev.Memory, newStatus.Memory) ||
 		prev.TelemetryValid != newStatus.TelemetryValid ||
-		prev.MSSince != newStatus.MSSince || prev.ServiceMapValid != newStatus.ServiceMapValid || !serviceMapEqual(prev.Services, newStatus.Services) || !stringPtrEqual(prev.ClusterUUID, newStatus.ClusterUUID)
+		prev.MSSince != newStatus.MSSince || prev.ServiceMapValid != newStatus.ServiceMapValid || !serviceMapEqual(prev.Services, newStatus.Services) || !stringPtrEqual(prev.ClusterUUID, newStatus.ClusterUUID) || prev.LlamaCppUp != newStatus.LlamaCppUp || prev.LlamaCppPort != newStatus.LlamaCppPort || !stringSliceEqual(prev.LlamaCppModels, newStatus.LlamaCppModels) || !stringSliceEqual(prev.LlamaCppLoaded, newStatus.LlamaCppLoaded)
 
 	if changed {
 		slog.Info("manual node state changed",
