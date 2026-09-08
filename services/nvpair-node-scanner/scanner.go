@@ -49,7 +49,8 @@ type NodeInfoResponse struct {
 	// from empty: a node too old to report the field says nothing about its
 	// membership, while a node reporting "" is asserting it has none. Reading
 	// absent as unclustered would mark a clustered peer invitable.
-	ClusterUUID *string `json:"clusterUuid"`
+	ClusterUUID *string            `json:"clusterUuid"`
+	Services    noderec.ServiceMap `json:"services,omitempty"`
 }
 
 type ReadyParams struct {

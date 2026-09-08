@@ -29,7 +29,10 @@
 package noderec
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -108,6 +111,98 @@ var serviceKeyOrder = []ServiceKey{
 	ServiceNodeInfo, ServiceOllama, ServiceLMStudio, ServiceLlamaCpp,
 	ServiceErrors, ServiceWorkload, ServiceCluster, ServiceEngineManager,
 	ServiceEngineControl,
+}
+
+const maxServiceMapBytes = 4096
+const maxServiceMapEntries = 32
+
+// ServiceMap is the bounded node-info service-port wire map. Unknown keys are
+// ignored for forward compatibility; malformed, duplicate, or invalid known
+// entries reject the whole map so partial attacker-controlled routing state is
+// never projected as authoritative.
+type ServiceMap map[ServiceKey]int
+
+func KnownServiceKey(s ServiceKey) bool {
+	for _, known := range serviceKeyOrder {
+		if s == known {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *ServiceMap) UnmarshalJSON(data []byte) error {
+	if len(data) > maxServiceMapBytes {
+		return fmt.Errorf("service map exceeds %d bytes", maxServiceMapBytes)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return fmt.Errorf("service map must be an object")
+	}
+	seen := make(map[string]bool)
+	out := make(ServiceMap)
+	count := 0
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("service key must be a string")
+		}
+		count++
+		if count > maxServiceMapEntries {
+			return fmt.Errorf("service map exceeds %d entries", maxServiceMapEntries)
+		}
+		if seen[key] {
+			return fmt.Errorf("duplicate service key %q", key)
+		}
+		seen[key] = true
+		svc := ServiceKey(key)
+		if !KnownServiceKey(svc) {
+			var ignored json.RawMessage
+			if err := dec.Decode(&ignored); err != nil {
+				return fmt.Errorf("service %q value: %w", key, err)
+			}
+			continue
+		}
+		var port int
+		if err := dec.Decode(&port); err != nil {
+			return fmt.Errorf("service %q port: %w", key, err)
+		}
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("service %q port must be 1..65535", key)
+		}
+		out[svc] = port
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing service map data")
+		}
+		return err
+	}
+	*m = out
+	return nil
+}
+
+func (m ServiceMap) Clone() ServiceMap {
+	if m == nil {
+		return nil
+	}
+	out := make(ServiceMap, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // Transport is the connection policy for a service, derived (not advertised).
@@ -327,6 +422,7 @@ const (
 	// record keeps its last observed value indefinitely.
 	MethodSetClusterIdentity = "nodeinfo:set-cluster-identity"
 
+	MethodSetServices = "nodeinfo:set-services"
 	// NotifyObservedAddresses is nvpair-node-info -> broker: the local addresses
 	// peers have actually reached this node on, learned from its own accepted
 	// connections.
@@ -397,6 +493,11 @@ type UnregisterParams struct {
 // announced — so the field is always sent.
 type ClusterIdentityParams struct {
 	ClusterUUID string `json:"clusterUuid"`
+}
+
+// ServiceMapParams replaces node-info's complete local service snapshot.
+type ServiceMapParams struct {
+	Services ServiceMap `json:"services"`
 }
 
 // ObservedAddressesParams carries the local addresses remote peers have reached

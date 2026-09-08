@@ -672,3 +672,20 @@ func writeClusterIdentityFrame(mu *sync.Mutex, w io.Writer, clusterUUID string) 
 	_, err = w.Write(data)
 	return err
 }
+
+func writeServiceMapFrame(mu *sync.Mutex, w io.Writer, services noderec.ServiceMap) error {
+	frame := struct {
+		JSONRPC string                   `json:"jsonrpc"`
+		Method  string                   `json:"method"`
+		Params  noderec.ServiceMapParams `json:"params"`
+	}{JSONRPC: "2.0", Method: noderec.MethodSetServices, Params: noderec.ServiceMapParams{Services: services.Clone()}}
+	data, err := json.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	mu.Lock()
+	defer mu.Unlock()
+	_, err = w.Write(data)
+	return err
+}

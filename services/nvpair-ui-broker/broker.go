@@ -406,6 +406,8 @@ func (b *Broker) registerService(p noderec.RegisterParams) {
 	if sc := b.getScanner(); sc != nil {
 		go sc.pushRegister(p)
 	}
+	b.pushServicesToNodeInfo()
+	b.pushDirectConnectToClusterManager()
 }
 
 // unregisterService removes a local service from the cache and the daemon.
@@ -416,6 +418,8 @@ func (b *Broker) unregisterService(svc noderec.ServiceKey) {
 	if sc := b.getScanner(); sc != nil {
 		go sc.pushUnregister(svc)
 	}
+	b.pushServicesToNodeInfo()
+	b.pushDirectConnectToClusterManager()
 }
 
 // get*/set* are the workersMu-guarded accessors for the supervised worker
@@ -636,6 +640,7 @@ func (b *Broker) spawnNodeInfo() (supervisedHandle, error) {
 	// node-info binds the fixed :14318 (force_ports is inert), so the broker
 	// knows its port. Idempotent across restarts.
 	b.registerService(noderec.RegisterParams{Service: noderec.ServiceNodeInfo, Port: nodeInfoHTTPPort})
+	b.pushServicesToNodeInfo()
 	slog.Info("node-info started", "path", b.nodeInfoPath, "pid", np.cmd.Process.Pid)
 	return np, nil
 }
@@ -910,6 +915,9 @@ func (b *Broker) spawnClusterManager() (supervisedHandle, error) {
 	// spawn restores before app:ready/readLoop (no client-visible race); also
 	// covers a crash respawn.
 	b.restoreClusterIdentity(cm)
+	// A restarted cluster-manager holds no descriptor (memory-only), so replay
+	// the complete current snapshot through the freshly spawned handle.
+	b.pushDirectConnectVia(cm)
 	// Converge the scanner's advertised uuid= on the cluster principal. The
 	// scanner spawns first and mints its own node-id before cluster-manager
 	// writes identity.json, so on a fresh host its uuid= can start out diverged.
@@ -1134,6 +1142,22 @@ func (b *Broker) clusterPrincipal() string {
 // the next spawn pushes again. A failed write is warned about rather than traced,
 // because until the next push lands peers cannot learn this node's membership
 // over HTTP — which is the whole point of reporting it.
+func (b *Broker) pushServicesToNodeInfo() {
+	np := b.getNodeInfo()
+	if np == nil {
+		return
+	}
+	services := make(noderec.ServiceMap)
+	for _, p := range b.regCache.Snapshot() {
+		if noderec.KnownServiceKey(p.Service) && p.Port > 0 && p.Port <= 65535 {
+			services[p.Service] = p.Port
+		}
+	}
+	if err := np.SetServices(services); err != nil {
+		slog.Warn("failed to push service snapshot to node-info", "err", err)
+	}
+}
+
 func (b *Broker) pushClusterIdentityToNodeInfo() {
 	np := b.getNodeInfo()
 	if np == nil {
@@ -1268,6 +1292,18 @@ func (b *Broker) forwardManualNodesNotification(method string, params json.RawMe
 // under that same key so scheduler priority and scheduledOn resolve to it. If
 // the alias's key changed (node-info revealed its real UUID) the
 // old key is reprojected from a surviving alias or released.
+func (b *Broker) updateManualRelay(s manualNodeStatus, key string) {
+	if b.relayDir == nil {
+		return
+	}
+	n, ok := manualToDirectoryNode(s)
+	if !ok {
+		b.relayDir.ApplyManual(noderec.NotifyNodeRemoved, noderec.DirectoryNode{HostUUID: key})
+		return
+	}
+	b.relayDir.ApplyManual(noderec.NotifyNodeUpdated, n)
+}
+
 func (b *Broker) upsertManualNode(s manualNodeStatus) {
 	en := manualToEnriched(s)
 	key := en.storeKey()
@@ -1280,6 +1316,7 @@ func (b *Broker) upsertManualNode(s manualNodeStatus) {
 	b.manualMu.Unlock()
 
 	b.store.Upsert(en, sourceManual)
+	b.updateManualRelay(s, key)
 	b.ingestTelemetryAt(sourceManual, manualNodeTelemetry(s, key), receivedAt)
 	// Bridge a reachable manual node into each engine's proxy (ollama-proxy /
 	// lmstudio-proxy) so inference can route to it; an unreachable engine is
@@ -1325,11 +1362,15 @@ func (b *Broker) reprojectOrRelease(key string) {
 	b.manualMu.Unlock()
 	if ok {
 		b.store.Upsert(manualToEnriched(survivor.status), sourceManual)
+		b.updateManualRelay(survivor.status, key)
 		b.bridgeManualNode(survivor.status, key)
 		b.ingestTelemetryAt(sourceManual, manualNodeTelemetry(survivor.status, key), survivor.receivedAt)
 		return
 	}
 	b.store.Remove(key, sourceManual)
+	if b.relayDir != nil {
+		b.relayDir.ApplyManual(noderec.NotifyNodeRemoved, noderec.DirectoryNode{HostUUID: key})
+	}
 	b.removeManualNodeFromProxies(key)
 	b.removeTelemetry(sourceManual, key)
 }
@@ -1372,6 +1413,9 @@ func (b *Broker) clearManualNodesState() {
 		seen[key] = true
 		// Drop only the manual claim; a co-located scanner node keeps its record.
 		b.store.Remove(key, sourceManual)
+		if b.relayDir != nil {
+			b.relayDir.ApplyManual(noderec.NotifyNodeRemoved, noderec.DirectoryNode{HostUUID: key})
+		}
 		b.removeTelemetry(sourceManual, key)
 		// Pull the now-orphaned node out of every proxy too, so inference
 		// doesn't keep a stale manual target the crashed prober can no
