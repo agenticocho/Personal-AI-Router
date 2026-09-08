@@ -20,14 +20,20 @@ import (
 // (bridgeManualNode); the rest project into the discovery store via
 // manualToEnriched.
 type manualNodeStatus struct {
-	ID             string      `json:"id"`
-	Address        string      `json:"address"`
-	OllamaUp       bool        `json:"ollama_up"`
-	OllamaPort     int         `json:"ollama_port"`
-	OllamaModels   []string    `json:"ollama_models,omitempty"`
-	LMStudioUp     bool        `json:"lmstudio_up"`
-	LMStudioPort   int         `json:"lmstudio_port"`
-	LMStudioModels []string    `json:"lmstudio_models,omitempty"`
+	ID             string   `json:"id"`
+	Address        string   `json:"address"`
+	OllamaUp       bool     `json:"ollama_up"`
+	OllamaPort     int      `json:"ollama_port"`
+	OllamaModels   []string `json:"ollama_models,omitempty"`
+	LMStudioUp     bool     `json:"lmstudio_up"`
+	LMStudioPort   int      `json:"lmstudio_port"`
+	LMStudioModels []string `json:"lmstudio_models,omitempty"`
+	// llama.cpp inventory read by the prober over the pin, on the port the
+	// authenticated descriptor named. Zero unless that bootstrap was accepted.
+	LlamaCppUp     bool        `json:"llamacpp_up"`
+	LlamaCppPort   int         `json:"llamacpp_port"`
+	LlamaCppModels []string    `json:"llamacpp_models,omitempty"`
+	LlamaCppLoaded []string    `json:"llamacpp_loaded,omitempty"`
 	NodeInfoPort   int         `json:"node_info_port"`
 	GPUs           []GPUInfo   `json:"gpus"`
 	CPU            *CPUInfo    `json:"cpu"`
@@ -83,15 +89,21 @@ func manualToEnriched(s manualNodeStatus) EnrichedNode {
 		hostUUID = s.ID
 	}
 	en := EnrichedNode{
-		ID:             s.ID,
-		HostUUID:       hostUUID,
-		Host:           s.Address,
-		Port:           s.NodeInfoPort,
+		ID:       s.ID,
+		HostUUID: hostUUID,
+		Host:     s.Address,
+		Port:     s.NodeInfoPort,
+		// Carried through so the client-facing snapshot agrees with the relay
+		// claim. Their divergence is why an authenticated peer rendered as
+		// untrusted while its directory entry was annotated correctly.
+		Trusted:        manualTrusted(s),
+		Clustered:      manualClusterUUID(s) != "",
 		GPUs:           s.GPUs,
 		CPU:            s.CPU,
 		Memory:         s.Memory,
-		Models:         mergeModels(s.OllamaModels, s.LMStudioModels),
+		Models:         mergeModels(s.OllamaModels, s.LMStudioModels, s.LlamaCppModels),
 		ModelsByEngine: manualModelsByEngine(s),
+		LoadedByEngine: manualLoadedByEngine(s),
 	}
 	if s.Address != "" {
 		en.Addresses = []string{s.Address}
@@ -111,6 +123,9 @@ func manualModelsByEngine(s manualNodeStatus) map[string][]string {
 	}
 	if len(s.LMStudioModels) > 0 {
 		byEngine["lmstudio"] = s.LMStudioModels
+	}
+	if len(s.LlamaCppModels) > 0 {
+		byEngine[llamaCppEngineName] = s.LlamaCppModels
 	}
 	if len(byEngine) == 0 {
 		return nil
@@ -237,5 +252,5 @@ func manualToDirectoryNode(s manualNodeStatus) (noderec.DirectoryNode, bool) {
 	if s.ClusterUUID != nil {
 		cluster = *s.ClusterUUID
 	}
-	return noderec.DirectoryNode{HostUUID: s.HostUUID, Name: s.ID, IP: s.Address, IPs: []string{s.Address}, ClusterUUID: cluster, Trusted: cluster != "", Services: services, GPUs: s.GPUs, CPU: s.CPU, Memory: s.Memory, Models: mergeModels(s.OllamaModels, s.LMStudioModels), ModelsByEngine: manualModelsByEngine(s)}, true
+	return noderec.DirectoryNode{HostUUID: s.HostUUID, Name: s.ID, IP: s.Address, IPs: []string{s.Address}, ClusterUUID: cluster, Trusted: manualTrusted(s), Services: services, GPUs: s.GPUs, CPU: s.CPU, Memory: s.Memory, Models: mergeModels(s.OllamaModels, s.LMStudioModels, s.LlamaCppModels), ModelsByEngine: manualModelsByEngine(s), LoadedByEngine: manualLoadedByEngine(s)}, true
 }
