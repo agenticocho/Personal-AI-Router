@@ -37,7 +37,22 @@ const rosterPath = "/v1/cluster/roster"
 // roster into our state and reply with our own so convergence is symmetric in
 // one round trip (mirrors nvpair-errors peer-sync).
 func (m *Manager) handleRoster(w http.ResponseWriter, r *http.Request) {
+	// An authenticated GET is a read: a pinned member asking for our roster,
+	// including the additive direct-connect descriptor. Same verifyClientPin
+	// gate as the POST reconcile, and deliberately no mergeRoster and no
+	// mutation of membership, pins, identity, the descriptor, or disk - a
+	// discovery probe must never change peer state.
+	if r.Method == http.MethodGet {
+		if _, ok := m.verifyClientPin(r); !ok {
+			m.rejectRosterReconcile(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(m.buildLocalRoster())
+		return
+	}
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}

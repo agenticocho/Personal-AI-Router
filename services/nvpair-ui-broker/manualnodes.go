@@ -38,7 +38,10 @@ type manualNodeStatus struct {
 	// node-info /v1/node-info. It lets a manual node key by the same permanent
 	// identity as mDNS-discovered nodes (and dedup with itself when the same
 	// machine is also discovered). Empty until the node-info probe succeeds.
-	HostUUID string `json:"hostUuid,omitempty"`
+	HostUUID        string             `json:"hostUuid,omitempty"`
+	ClusterUUID     *string            `json:"clusterUuid,omitempty"`
+	Services        noderec.ServiceMap `json:"services,omitempty"`
+	ServiceMapValid bool               `json:"serviceMapValid,omitempty"`
 }
 
 type manualNodeStatusEntry struct {
@@ -220,4 +223,19 @@ func (b *Broker) callProxyManual(p *proxyProcess, engine, method string, params 
 	} else if rpcErr != nil {
 		slog.Warn("manual->proxy bridge rejected", "engine", engine, "method", method, "id", id, "code", rpcErr.Code, "msg", rpcErr.Message)
 	}
+}
+
+func manualToDirectoryNode(s manualNodeStatus) (noderec.DirectoryNode, bool) {
+	if !s.ServiceMapValid || s.HostUUID == "" || s.Address == "" || len(s.Services) == 0 {
+		return noderec.DirectoryNode{}, false
+	}
+	services := make(map[noderec.ServiceKey]noderec.ServiceStatus, len(s.Services))
+	for k, p := range s.Services {
+		services[k] = noderec.ServiceStatus{Port: p}
+	}
+	cluster := ""
+	if s.ClusterUUID != nil {
+		cluster = *s.ClusterUUID
+	}
+	return noderec.DirectoryNode{HostUUID: s.HostUUID, Name: s.ID, IP: s.Address, IPs: []string{s.Address}, ClusterUUID: cluster, Trusted: cluster != "", Services: services, GPUs: s.GPUs, CPU: s.CPU, Memory: s.Memory, Models: mergeModels(s.OllamaModels, s.LMStudioModels), ModelsByEngine: manualModelsByEngine(s)}, true
 }

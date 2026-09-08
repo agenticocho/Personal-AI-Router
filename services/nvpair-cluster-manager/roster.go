@@ -13,6 +13,8 @@ import (
 	"net"
 	"strconv"
 	"time"
+
+	"nvpair-shared/noderec"
 )
 
 // RosterEntry is one member's identity + cert + the endorsements that admit it,
@@ -36,6 +38,9 @@ type Roster struct {
 	Members       []RosterEntry  `json:"members"`
 	Tombstones    []Tombstone    `json:"tombstones,omitempty"` // legacy compatibility
 	RemovalProofs []RemovalProof `json:"removalProofs,omitempty"`
+	// DirectConnect is the additive, authenticated direct-connect descriptor.
+	// Consumers that predate it ignore it; peers that do not publish one omit it.
+	DirectConnect *noderec.DirectConnect `json:"directConnect,omitempty"`
 }
 
 // selfPub returns this node's own Ed25519 public key.
@@ -62,6 +67,7 @@ func (m *Manager) buildLocalRoster() *Roster {
 		Tombstones:    m.snapshotTombstones(),
 		RemovalProofs: m.snapshotRemovalProofs(),
 	}
+	r.DirectConnect = m.directConnectDescriptor()
 
 	// Self entry — consumed by the already-trusting mTLS peer to refresh our
 	// metadata; it carries no endorsement (the peer already trusts us) and no

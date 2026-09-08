@@ -19,6 +19,7 @@ import (
 	"nvpair-shared/applog"
 	"nvpair-shared/clustertrust"
 	"nvpair-shared/errors"
+	"nvpair-shared/noderec"
 )
 
 // Version is stamped at build time via -ldflags "-X main.Version=...".
@@ -77,7 +78,9 @@ type NodeInfoResponse struct {
 	// identity as the rest of the fleet — including deduping with the same
 	// machine if it's also discovered over mDNS. Empty when the remote
 	// predates this field or isn't a NVPAIR node-info server.
-	HostUUID string `json:"hostUuid,omitempty"`
+	HostUUID    string             `json:"hostUuid,omitempty"`
+	ClusterUUID *string            `json:"clusterUuid,omitempty"`
+	Services    noderec.ServiceMap `json:"services,omitempty"`
 }
 
 // ManualEntry is the user-supplied identity of a manually added
@@ -127,7 +130,10 @@ type ManualNodeStatus struct {
 	// HostUUID is the remote's stable per-host identity from node-info, so a
 	// manual node carries the same permanent identity the rest of the system
 	// keys on. Empty when node-info didn't report one.
-	HostUUID string `json:"hostUuid,omitempty"`
+	HostUUID        string             `json:"hostUuid,omitempty"`
+	ClusterUUID     *string            `json:"clusterUuid,omitempty"`
+	Services        noderec.ServiceMap `json:"services,omitempty"`
+	ServiceMapValid bool               `json:"serviceMapValid,omitempty"`
 }
 
 type ReadyParams struct {
@@ -280,26 +286,63 @@ func (m *Manager) probeNode(entry ManualEntry) {
 	}
 	nodeInfoUp, info := m.probeNodeInfo(probeClient, scheme, addr, nodeInfoPort)
 
+	// Plaintext node-info is a hint source only. Service authority comes from
+	// the pinned-mTLS roster descriptor fetched over the same authenticated
+	// channel, and the tri-state outcome decides whether legacy behavior may
+	// be preserved (descriptor absent) or must be suppressed (auth failed).
+	var authServices noderec.ServiceMap
+	authOutcome := directConnectAbsent
+	if nodeInfoUp {
+		authServices, authOutcome = m.authenticateDirectConnect(addr, info, directConnectMemory.prior(id))
+		if info.ClusterUUID != nil && *info.ClusterUUID != "" {
+			directConnectMemory.remember(id, *info.ClusterUUID)
+		}
+	}
+	serviceMapValid := authOutcome == directConnectAccepted
+	switch authOutcome {
+	case directConnectAccepted:
+		// Every routed service comes from the authenticated descriptor.
+		if port, ok := authServices[noderec.ServiceOllama]; ok {
+			ollamaUp, ollamaModels = m.probeOllama(addr, port)
+		} else {
+			ollamaUp, ollamaModels = false, nil
+		}
+		if port, ok := authServices[noderec.ServiceLMStudio]; ok {
+			lmStudioUp, lmStudioModels = m.probeLMStudio(addr, port)
+		} else {
+			lmStudioUp, lmStudioModels = false, nil
+		}
+	case directConnectFailed:
+		// A peer that answered but could not be authenticated gets no claim at
+		// all: legacy probing would otherwise report it as usable.
+		ollamaUp, ollamaModels = false, nil
+		lmStudioUp, lmStudioModels = false, nil
+		authServices = nil
+	}
+
 	newStatus := ManualNodeStatus{
-		ID:             id,
-		Name:           entry.Name,
-		Address:        addr,
-		OllamaUp:       ollamaUp,
-		OllamaPort:     11434,
-		OllamaModels:   ollamaModels,
-		LMStudioUp:     lmStudioUp,
-		LMStudioPort:   lmStudioPort,
-		LMStudioModels: lmStudioModels,
-		NodeInfoUp:     nodeInfoUp,
-		NodeInfoPort:   nodeInfoPort,
-		TLSEnabled:     entry.TLSPort > 0,
-		MTLSRequired:   entry.TLSPort > 0 && entry.MTLS,
-		GPUs:           info.GPUs,
-		CPU:            info.CPU,
-		Memory:         info.Memory,
-		TelemetryValid: info.TelemetryValid,
-		MSSince:        info.MSSince,
-		HostUUID:       info.HostUUID,
+		ID:              id,
+		Name:            entry.Name,
+		Address:         addr,
+		OllamaUp:        ollamaUp,
+		OllamaPort:      11434,
+		OllamaModels:    ollamaModels,
+		LMStudioUp:      lmStudioUp,
+		LMStudioPort:    lmStudioPort,
+		LMStudioModels:  lmStudioModels,
+		NodeInfoUp:      nodeInfoUp,
+		NodeInfoPort:    nodeInfoPort,
+		TLSEnabled:      entry.TLSPort > 0,
+		MTLSRequired:    entry.TLSPort > 0 && entry.MTLS,
+		GPUs:            info.GPUs,
+		CPU:             info.CPU,
+		Memory:          info.Memory,
+		TelemetryValid:  info.TelemetryValid,
+		MSSince:         info.MSSince,
+		HostUUID:        info.HostUUID,
+		ClusterUUID:     info.ClusterUUID,
+		Services:        authServices.Clone(),
+		ServiceMapValid: serviceMapValid,
 	}
 
 	reachable := newStatus.OllamaUp || newStatus.LMStudioUp || newStatus.NodeInfoUp
@@ -320,6 +363,12 @@ func (m *Manager) probeNode(entry ManualEntry) {
 	if !nodeInfoUp && newStatus.HostUUID == "" {
 		newStatus.HostUUID = prev.HostUUID
 	}
+	if nodeInfoUp && prev.HostUUID != "" && newStatus.HostUUID != prev.HostUUID {
+		slog.Warn("manual node identity changed; quarantining service map", "id", id, "expected", prev.HostUUID, "reported", newStatus.HostUUID)
+		newStatus.HostUUID = prev.HostUUID
+		newStatus.Services = nil
+		newStatus.ServiceMapValid = false
+	}
 	tn.status = newStatus
 	if reachable {
 		tn.consecutiveFails = 0
@@ -339,7 +388,7 @@ func (m *Manager) probeNode(entry ManualEntry) {
 		!cpuEqual(prev.CPU, newStatus.CPU) ||
 		!memoryEqual(prev.Memory, newStatus.Memory) ||
 		prev.TelemetryValid != newStatus.TelemetryValid ||
-		prev.MSSince != newStatus.MSSince
+		prev.MSSince != newStatus.MSSince || prev.ServiceMapValid != newStatus.ServiceMapValid || !serviceMapEqual(prev.Services, newStatus.Services) || !stringPtrEqual(prev.ClusterUUID, newStatus.ClusterUUID)
 
 	if changed {
 		slog.Info("manual node state changed",
@@ -671,6 +720,7 @@ func (m *Manager) handleMessage(msg *Message) {
 			log.Printf("failed to respond to node/remove: %v", err)
 		}
 		if removed {
+			directConnectMemory.forget(params.ID)
 			log.Printf("manual node removed: %s", params.ID)
 		}
 
@@ -753,6 +803,24 @@ func memoryEqual(a, b *MemoryInfo) bool {
 	}
 	if a == nil || b == nil {
 		return false
+	}
+	return *a == *b
+}
+
+func serviceMapEqual(a, b noderec.ServiceMap) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+func stringPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
 	}
 	return *a == *b
 }

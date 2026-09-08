@@ -142,6 +142,10 @@ type Manager struct {
 
 	cancel context.CancelFunc
 
+	// directConnect is the memory-only direct-connect descriptor this node
+	// publishes on its authenticated roster response. Never persisted.
+	directConnect directConnectState
+
 	// Test-only removal boundary hooks; nil in production.
 	testRemovalPrepared chan struct{}
 	testRemovalContinue chan struct{}
@@ -399,6 +403,8 @@ func (m *Manager) handleMessage(msg *Message) {
 		switch msg.Method {
 		case noderec.NotifyNodes:
 			m.applyDiscovery(msg)
+		case noderec.MethodSetDirectConnect:
+			m.applyDirectConnect(msg)
 		default:
 			log.Printf("ignoring unhandled notification %q", msg.Method)
 		}
@@ -409,6 +415,9 @@ func (m *Manager) handleMessage(msg *Message) {
 	}
 
 	switch msg.Method {
+	case noderec.MethodSetDirectConnect:
+		m.applyDirectConnect(msg)
+		m.codec.Respond(msg.ID, nil)
 	case "cluster:get-node-id":
 		m.handleGetNodeID(msg)
 	case "cluster:set-identity":

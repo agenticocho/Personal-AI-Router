@@ -98,7 +98,8 @@ type NodeInfoResponse struct {
 	// answers before its parent has told it anything. Claiming "no cluster" on no
 	// evidence would have a peer clear a correct annotation and offer an invite
 	// its target will reject.
-	ClusterUUID *string `json:"clusterUuid,omitempty"`
+	ClusterUUID *string            `json:"clusterUuid,omitempty"`
+	Services    noderec.ServiceMap `json:"services,omitempty"`
 }
 
 // clusterIdentity is the cluster principal this node reports, kept current by
@@ -134,6 +135,48 @@ func (c *clusterIdentity) get() (string, bool) {
 // handleClusterIdentity applies a MethodSetClusterIdentity notification. A
 // malformed payload is dropped rather than latching a wrong membership: the
 // broker re-pushes on every change, so the next one corrects us.
+type serviceSnapshot struct {
+	mu       sync.RWMutex
+	services noderec.ServiceMap
+}
+
+func (s *serviceSnapshot) set(v noderec.ServiceMap) {
+	s.mu.Lock()
+	s.services = v.Clone()
+	s.mu.Unlock()
+}
+func (s *serviceSnapshot) get() noderec.ServiceMap {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.services.Clone()
+}
+
+func handleServiceSnapshot(msg applog.StdinMessage, snapshot *serviceSnapshot) {
+	if msg.Method != noderec.MethodSetServices {
+		return
+	}
+	var params noderec.ServiceMapParams
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		slog.Warn("ignoring malformed service snapshot push", "err", err)
+		return
+	}
+	snapshot.set(params.Services)
+	slog.Info("service snapshot updated", "services", len(params.Services))
+}
+
+func attachServices(body []byte, services noderec.ServiceMap) []byte {
+	var response NodeInfoResponse
+	if json.Unmarshal(body, &response) != nil {
+		return body
+	}
+	response.Services = services.Clone()
+	out, err := json.Marshal(response)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 func handleClusterIdentity(msg applog.StdinMessage, identity *clusterIdentity) {
 	if msg.Method != noderec.MethodSetClusterIdentity {
 		return
@@ -392,6 +435,7 @@ func main() {
 	// push the answer is genuinely unknown and the field is omitted. The two
 	// sources are mutually exclusive by construction.
 	identity := &clusterIdentity{}
+	serviceState := &serviceSnapshot{}
 	clusterPrincipal := func() *string {
 		if !clusterGated {
 			uuid, told := identity.get()
@@ -409,7 +453,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/node-info", nodeInfoHandler(mesh, func() []byte {
-		return buildResponse(gpus, cpu, memTotal, collector.Snapshot(), hostUUID, clusterPrincipal())
+		return attachServices(buildResponse(gpus, cpu, memTotal, collector.Snapshot(), hostUUID, clusterPrincipal()), serviceState.get())
 	}))
 
 	// Listener layout (set up below depending on flags). Exactly one of the two
@@ -549,6 +593,7 @@ func main() {
 
 	go applog.StdinRPC(notifier, func(msg applog.StdinMessage) {
 		handleClusterIdentity(msg, identity)
+		handleServiceSnapshot(msg, serviceState)
 	}, func() {
 		log.Print("stdin closed, shutting down")
 		cancel()

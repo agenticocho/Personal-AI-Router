@@ -1,40 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package relay is the broker's discovery relay. It owns two
-// halves of the star topology and is pure state + fanout logic — the broker
-// binary wires it to the scanner peer (daemon) and to client connections:
-//
-//   - RegistrationCache: the UPWARD half. This node's advertised services,
-//     registered by local workers (relayed) and by the broker's engine poller
-//     (ol/lm). The broker pushes the cached set down to the daemon and replays
-//     it whenever the daemon reports a new epoch (restart), so no worker needs
-//     reconnect logic.
-//   - Directory: the DOWNWARD half. Every LAN node, fed by the daemon's
-//     discovery:node-* events, with per-subscriber filtered fanout and a
-//     queryable snapshot for discovery:get-nodes.
+// Package relay owns the broker discovery star: local registration replay upward to the scanner and source-aware directory fanout downward to consumers.
 package relay
 
 import (
+	"nvpair-shared/noderec"
+	"reflect"
 	"sort"
 	"sync"
-
-	"nvpair-shared/noderec"
 )
 
-// RegistrationCache holds this node's service registrations, keyed by service.
+// RegistrationCache holds this node's current service registrations for deterministic scanner and node-info replay.
 type RegistrationCache struct {
 	mu   sync.Mutex
 	regs map[noderec.ServiceKey]noderec.RegisterParams
 }
 
+// NewRegistrationCache returns an empty registration cache.
 func NewRegistrationCache() *RegistrationCache {
 	return &RegistrationCache{regs: make(map[noderec.ServiceKey]noderec.RegisterParams)}
 }
 
-// Register adds or updates a service registration, reporting whether the cached
-// set changed (so the broker only re-pushes to the daemon on a real change).
-// update-txt is the same call with a new TXT.
+// Register adds or replaces one valid service registration and reports whether the cache changed.
 func (c *RegistrationCache) Register(p noderec.RegisterParams) bool {
 	if p.Service == "" || p.Port == 0 {
 		return false
@@ -48,19 +36,18 @@ func (c *RegistrationCache) Register(p noderec.RegisterParams) bool {
 	return true
 }
 
-// Unregister removes a service, reporting whether it existed.
-func (c *RegistrationCache) Unregister(s noderec.ServiceKey) bool {
+// Unregister withdraws one service and reports whether it existed.
+func (c *RegistrationCache) Unregister(k noderec.ServiceKey) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.regs[s]; !ok {
+	if _, ok := c.regs[k]; !ok {
 		return false
 	}
-	delete(c.regs, s)
+	delete(c.regs, k)
 	return true
 }
 
-// Snapshot returns the current registrations, sorted by service for a
-// deterministic replay order.
+// Snapshot returns registrations sorted by service key.
 func (c *RegistrationCache) Snapshot() []noderec.RegisterParams {
 	c.mu.Lock()
 	out := make([]noderec.RegisterParams, 0, len(c.regs))
@@ -71,7 +58,6 @@ func (c *RegistrationCache) Snapshot() []noderec.RegisterParams {
 	sort.Slice(out, func(i, j int) bool { return out[i].Service < out[j].Service })
 	return out
 }
-
 func registerEqual(a, b noderec.RegisterParams) bool {
 	if a.Service != b.Service || a.Port != b.Port || len(a.TXT) != len(b.TXT) {
 		return false
@@ -84,127 +70,213 @@ func registerEqual(a, b noderec.RegisterParams) bool {
 	return true
 }
 
-// Subscriber is a client interested in directory changes: a service filter and a
-// callback invoked (on the caller's goroutine, under no relay lock) with the
-// subscriber's full filtered node set on every change. Consumers replace their
-// set from it rather than applying deltas, so a dropped or reordered push can't
-// leave them drifted — every push is the authoritative current list.
+// Subscriber receives authoritative filtered directory snapshots.
 type Subscriber struct {
 	Filter noderec.SubscribeParams
-	Send   func(nodes []noderec.DirectoryNode)
-
-	// sendMu serializes deliveries to this subscriber so two concurrent
-	// deliveries — the initial post-subscribe delivery racing an Apply fan-out
-	// driven by the scanner read-pump — can't reorder and leave the subscriber
-	// holding an older set than a newer one. Combined with capturing the snapshot
-	// inside Deliver (at send time, not subscribe time), the last delivery to
-	// acquire it always carries the latest directory state.
+	Send   func([]noderec.DirectoryNode)
 	sendMu sync.Mutex
 }
+type nodeClaims struct {
+	scanner *noderec.DirectoryNode
+	manual  *noderec.DirectoryNode
+}
 
-// Directory is the broker's view of all LAN nodes (keyed by hostUuid) plus its
-// subscriber set. It's fed by the daemon's node-* events via Apply and queried
-// by discovery:get-nodes via Snapshot.
+// Directory merges scanner and authenticated manual claims by stable host UUID.
 type Directory struct {
 	mu     sync.Mutex
-	nodes  map[string]noderec.DirectoryNode
+	nodes  map[string]nodeClaims
 	subs   map[int]*Subscriber
 	nextID int
 }
 
+// NewDirectory returns an empty source-aware directory.
 func NewDirectory() *Directory {
-	return &Directory{
-		nodes: make(map[string]noderec.DirectoryNode),
-		subs:  make(map[int]*Subscriber),
-	}
+	return &Directory{nodes: make(map[string]nodeClaims), subs: make(map[int]*Subscriber)}
 }
 
-// Subscribe registers a subscriber and returns its id. The caller sends the
-// initial snapshot via Deliver after releasing its own lock — Deliver captures
-// the snapshot at send time, so a concurrent Apply can't sneak a newer snapshot
-// in and have this initial delivery overwrite it with an older one.
-func (d *Directory) Subscribe(sub *Subscriber) (id int) {
+// Subscribe registers a subscriber; callers invoke Deliver for its initial snapshot.
+func (d *Directory) Subscribe(s *Subscriber) (id int) {
 	d.mu.Lock()
 	d.nextID++
 	id = d.nextID
-	d.subs[id] = sub
+	d.subs[id] = s
 	d.mu.Unlock()
-	return id
+	return
 }
 
-// Deliver pushes the subscriber its current filtered snapshot, serialized
-// per-subscriber. Capturing the snapshot here (at delivery time) rather than
-// handing Send a pre-captured slice means a delivery can never carry a set older
-// than the directory's state when it actually runs; the per-subscriber lock then
-// guarantees the initial post-subscribe delivery and a concurrent Apply fan-out
-// settle on the latest set regardless of which runs last.
-func (d *Directory) Deliver(sub *Subscriber) {
-	sub.sendMu.Lock()
-	defer sub.sendMu.Unlock()
+// Unsubscribe removes a subscriber.
+func (d *Directory) Unsubscribe(id int) { d.mu.Lock(); delete(d.subs, id); d.mu.Unlock() }
+
+// Deliver serializes and sends the subscriber's latest full filtered snapshot.
+func (d *Directory) Deliver(s *Subscriber) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	d.mu.Lock()
-	nodes := d.filteredLocked(sub.Filter)
+	nodes := d.filteredLocked(s.Filter)
 	d.mu.Unlock()
-	sub.Send(nodes)
+	s.Send(nodes)
 }
-
-// filteredLocked returns the nodes matching a subscriber's filter, sorted by
-// hostUuid for a deterministic set. Caller must hold d.mu.
 func (d *Directory) filteredLocked(f noderec.SubscribeParams) []noderec.DirectoryNode {
 	out := make([]noderec.DirectoryNode, 0, len(d.nodes))
-	for _, n := range d.nodes {
-		if f.Matches(n) {
+	for _, c := range d.nodes {
+		n, ok := project(c)
+		if ok && f.Matches(n) {
 			out = append(out, n)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].HostUUID < out[j].HostUUID })
 	return out
 }
-
-// Unsubscribe removes a subscriber.
-func (d *Directory) Unsubscribe(id int) {
-	d.mu.Lock()
-	delete(d.subs, id)
-	d.mu.Unlock()
+func cloneStringMap(in map[string][]string) map[string][]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(in))
+	for key, values := range in {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
 }
 
-// Apply folds a daemon node-* delta into the directory, then re-sends every
-// subscriber its full filtered snapshot. method (one of noderec.NotifyNode{
-// Discovered,Updated,Removed}) only updates the directory — removed drops the
-// node by hostUuid, discovered/updated upsert it. Every subscriber is re-pushed
-// on any change (not just those matching the changed node) so each consumer's
-// set is always the authoritative current list; the push is idempotent (the
-// consumer replaces with the same set), so a re-push for an unrelated change is a
-// cheap no-op at this scale.
-func (d *Directory) Apply(method string, node noderec.DirectoryNode) {
-	d.mu.Lock()
-	if method == noderec.NotifyNodeRemoved {
-		delete(d.nodes, node.HostUUID)
-	} else {
-		d.nodes[node.HostUUID] = node
+func appendUnique(dst []string, values ...[]string) []string {
+	seen := make(map[string]bool, len(dst))
+	for _, value := range dst {
+		seen[value] = true
 	}
+	for _, list := range values {
+		for _, value := range list {
+			if value != "" && !seen[value] {
+				seen[value] = true
+				dst = append(dst, value)
+			}
+		}
+	}
+	return dst
+}
+
+func cloneNode(n noderec.DirectoryNode) noderec.DirectoryNode {
+	out := n
+	out.IPs = append([]string(nil), n.IPs...)
+	out.GPUs = append([]noderec.GPUInfo(nil), n.GPUs...)
+	out.Models = append([]string(nil), n.Models...)
+	out.ModelsByEngine = cloneStringMap(n.ModelsByEngine)
+	out.LoadedByEngine = cloneStringMap(n.LoadedByEngine)
+	if n.CPU != nil {
+		value := *n.CPU
+		out.CPU = &value
+	}
+	if n.Memory != nil {
+		value := *n.Memory
+		out.Memory = &value
+	}
+	out.Services = make(map[noderec.ServiceKey]noderec.ServiceStatus, len(n.Services))
+	for k, v := range n.Services {
+		out.Services[k] = v
+	}
+	return out
+}
+func project(c nodeClaims) (noderec.DirectoryNode, bool) {
+	if c.scanner == nil && c.manual == nil {
+		return noderec.DirectoryNode{}, false
+	}
+	if c.scanner == nil {
+		return cloneNode(*c.manual), true
+	}
+	out := cloneNode(*c.scanner)
+	if c.manual != nil {
+		if out.Services == nil {
+			out.Services = make(map[noderec.ServiceKey]noderec.ServiceStatus)
+		}
+		for k, v := range c.manual.Services {
+			if _, ok := out.Services[k]; !ok {
+				out.Services[k] = v
+			}
+		}
+		out.Models = appendUnique(out.Models, c.manual.Models)
+		if c.manual.ModelsByEngine != nil {
+			if out.ModelsByEngine == nil {
+				out.ModelsByEngine = make(map[string][]string)
+			}
+			for engine, models := range c.manual.ModelsByEngine {
+				if _, exists := out.ModelsByEngine[engine]; !exists {
+					out.ModelsByEngine[engine] = append([]string(nil), models...)
+				}
+			}
+		}
+		seen := make(map[string]bool)
+		addresses := make([]string, 0, len(c.manual.CandidateIPs())+len(out.CandidateIPs()))
+		for _, addr := range append(c.manual.CandidateIPs(), out.CandidateIPs()...) {
+			if addr != "" && !seen[addr] {
+				seen[addr] = true
+				addresses = append(addresses, addr)
+			}
+		}
+		if len(addresses) > 0 {
+			out.IP = addresses[0]
+		}
+		if len(addresses) > 1 {
+			out.IPs = addresses
+		} else {
+			out.IPs = nil
+		}
+	}
+	return out, true
+}
+
+// Apply folds a scanner-owned claim into the directory.
+func (d *Directory) Apply(method string, n noderec.DirectoryNode) { d.apply(false, method, n) }
+
+// ApplyManual folds an authenticated manual/direct claim into the directory.
+func (d *Directory) ApplyManual(method string, n noderec.DirectoryNode) { d.apply(true, method, n) }
+func (d *Directory) apply(manual bool, method string, n noderec.DirectoryNode) {
+	if n.HostUUID == "" {
+		return
+	}
+	d.mu.Lock()
+	c := d.nodes[n.HostUUID]
+	before, bok := project(c)
+	if method == noderec.NotifyNodeRemoved {
+		if manual {
+			c.manual = nil
+		} else {
+			c.scanner = nil
+		}
+	} else {
+		cp := cloneNode(n)
+		if manual {
+			c.manual = &cp
+		} else {
+			c.scanner = &cp
+		}
+	}
+	after, aok := project(c)
+	if !aok {
+		delete(d.nodes, n.HostUUID)
+	} else {
+		d.nodes[n.HostUUID] = c
+	}
+	changed := bok != aok || !reflect.DeepEqual(before, after)
 	subs := make([]*Subscriber, 0, len(d.subs))
-	for _, s := range d.subs {
-		subs = append(subs, s)
+	if changed {
+		for _, s := range d.subs {
+			subs = append(subs, s)
+		}
 	}
 	d.mu.Unlock()
-	// Deliver captures each subscriber's snapshot at send time (under its
-	// per-subscriber lock), so this fan-out and a concurrent initial delivery
-	// can't reorder into a stale set.
 	for _, s := range subs {
 		d.Deliver(s)
 	}
 }
 
-// Snapshot returns the directory optionally filtered to one service, sorted by
-// hostUuid.
+// Snapshot returns the current projected directory, optionally filtered by service.
 func (d *Directory) Snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode {
 	d.mu.Lock()
 	out := make([]noderec.DirectoryNode, 0, len(d.nodes))
-	for _, n := range d.nodes {
-		if filter != "" && !n.HasService(filter) {
-			continue
+	for _, c := range d.nodes {
+		n, ok := project(c)
+		if ok && (filter == "" || n.HasService(filter)) {
+			out = append(out, n)
 		}
-		out = append(out, n)
 	}
 	d.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].HostUUID < out[j].HostUUID })

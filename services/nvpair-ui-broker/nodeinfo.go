@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+
+	"nvpair-shared/noderec"
 )
 
 // maxNodeInfoLine caps one stdout frame from node-info. Its frames are a handful
@@ -56,6 +58,10 @@ func (n *nodeInfoProcess) SetLogLevel(level string) error {
 // stop treating this node as unavailable for pairing.
 func (n *nodeInfoProcess) SetClusterIdentity(clusterUUID string) error {
 	return writeClusterIdentityFrame(&n.stdinMu, n.stdin, clusterUUID)
+}
+
+func (n *nodeInfoProcess) SetServices(services noderec.ServiceMap) error {
+	return writeServiceMapFrame(&n.stdinMu, n.stdin, services)
 }
 
 // Done implements supervisedHandle: the returned channel closes once the
